@@ -2,11 +2,17 @@ use std::{sync::Arc, time::Duration};
 
 use dsh_rs_bridge::{
     MemoryEventSink, MemorySessionStore, MockRuntime, RuntimeError, RuntimeStatus,
-    RuntimeSupervisor, StartExecutionRequest,
+    RuntimeSupervisor, SessionStore, StartExecutionRequest,
 };
 use tokio_util::sync::CancellationToken;
 
-fn setup(delay: Duration) -> (RuntimeSupervisor, Arc<MemorySessionStore>, Arc<MemoryEventSink>) {
+fn setup(
+    delay: Duration,
+) -> (
+    RuntimeSupervisor,
+    Arc<MemorySessionStore>,
+    Arc<MemoryEventSink>,
+) {
     let sessions = Arc::new(MemorySessionStore::default());
     let events = Arc::new(MemoryEventSink::default());
     let supervisor = RuntimeSupervisor::new(sessions.clone(), events.clone());
@@ -43,18 +49,31 @@ async fn start_streams_events_and_reaches_completed() {
         .expect("wait");
     assert_eq!(finished.status, RuntimeStatus::Completed);
 
-    let record = sessions.get("session-a").await.expect("store").expect("record");
+    let record = sessions
+        .get("session-a")
+        .await
+        .expect("store")
+        .expect("record");
     assert_eq!(record.status, RuntimeStatus::Completed);
     let stream = events.events_for("session-a").await;
-    assert!(stream.iter().any(|item| item.event.event_type == "assistant.delta"));
-    assert!(stream.iter().any(|item| item.event.event_type == "runtime.ended"));
-    assert!(stream.windows(2).all(|pair| pair[0].host_seq < pair[1].host_seq));
+    assert!(stream
+        .iter()
+        .any(|item| item.event.event_type == "assistant.delta"));
+    assert!(stream
+        .iter()
+        .any(|item| item.event.event_type == "runtime.ended"));
+    assert!(stream
+        .windows(2)
+        .all(|pair| pair[0].host_seq < pair[1].host_seq));
 }
 
 #[tokio::test]
 async fn interrupt_converges_to_cancelled() {
     let (supervisor, _, _) = setup(Duration::from_millis(100));
-    supervisor.start(request("session-cancel")).await.expect("start");
+    supervisor
+        .start(request("session-cancel"))
+        .await
+        .expect("start");
     let finished = supervisor
         .interrupt("session-cancel", "test cancellation")
         .await
@@ -65,7 +84,10 @@ async fn interrupt_converges_to_cancelled() {
 #[tokio::test]
 async fn resume_keeps_external_session_identity() {
     let (supervisor, _, events) = setup(Duration::from_millis(1));
-    let first = supervisor.start(request("session-resume")).await.expect("start");
+    let first = supervisor
+        .start(request("session-resume"))
+        .await
+        .expect("start");
     supervisor
         .wait_for_terminal("session-resume")
         .await
@@ -95,8 +117,14 @@ async fn resume_keeps_external_session_identity() {
 #[tokio::test]
 async fn concurrent_sessions_are_isolated() {
     let (supervisor, _, events) = setup(Duration::from_millis(5));
-    let a = supervisor.start(request("session-a")).await.expect("start a");
-    let b = supervisor.start(request("session-b")).await.expect("start b");
+    let a = supervisor
+        .start(request("session-a"))
+        .await
+        .expect("start a");
+    let b = supervisor
+        .start(request("session-b"))
+        .await
+        .expect("start b");
     assert_ne!(a.external_session_id, b.external_session_id);
 
     let (a, b) = tokio::join!(
@@ -105,8 +133,16 @@ async fn concurrent_sessions_are_isolated() {
     );
     assert_eq!(a.expect("a terminal").status, RuntimeStatus::Completed);
     assert_eq!(b.expect("b terminal").status, RuntimeStatus::Completed);
-    assert!(events.events_for("session-a").await.iter().all(|e| e.event.dsh_session_id == "session-a"));
-    assert!(events.events_for("session-b").await.iter().all(|e| e.event.dsh_session_id == "session-b"));
+    assert!(events
+        .events_for("session-a")
+        .await
+        .iter()
+        .all(|e| e.event.dsh_session_id == "session-a"));
+    assert!(events
+        .events_for("session-b")
+        .await
+        .iter()
+        .all(|e| e.event.dsh_session_id == "session-b"));
 }
 
 #[tokio::test]
@@ -124,7 +160,10 @@ async fn one_shot_runtime_rejects_follow_up_input() {
 #[tokio::test]
 async fn duplicate_session_start_is_rejected() {
     let (supervisor, _, _) = setup(Duration::from_millis(100));
-    supervisor.start(request("session-duplicate")).await.expect("start");
+    supervisor
+        .start(request("session-duplicate"))
+        .await
+        .expect("start");
     let result = supervisor.start(request("session-duplicate")).await;
     assert!(matches!(result, Err(RuntimeError::Lifecycle(_))));
     supervisor
