@@ -13,5 +13,7 @@ pub mod supervisor;
 pub use acp::{AcpRuntime, AcpRuntimeConfig};
 pub use contracts::*;
 pub use mock::MockRuntime;
-pub use store::{ExecutionEventSink, FileSessionStore, MemoryEventSink, MemorySessionStore, SessionStore};
+pub use store::{
+    ExecutionEventSink, FileSessionStore, MemoryEventSink, MemorySessionStore, SessionStore,
+};
 pub use supervisor::RuntimeSupervisor;

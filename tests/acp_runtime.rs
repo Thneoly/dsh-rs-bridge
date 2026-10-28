@@ -118,7 +118,6 @@ async fn acp_subprocess_streams_output_continues_and_cancels() {
         .expect("shutdown ACP subprocesses");
 }
 
-
 static NEXT_STORE_PATH: AtomicU64 = AtomicU64::new(1);
 
 fn persistent_store_path() -> PathBuf {
@@ -134,7 +133,11 @@ fn persistent_store_path() -> PathBuf {
 #[tokio::test]
 async fn acp_session_binding_survives_bridge_restart_and_restores_conversation() {
     let path = persistent_store_path();
-    let sessions = Arc::new(FileSessionStore::open(&path).await.expect("open file store"));
+    let sessions = Arc::new(
+        FileSessionStore::open(&path)
+            .await
+            .expect("open file store"),
+    );
     let first_events = Arc::new(MemoryEventSink::default());
     let first_supervisor = RuntimeSupervisor::new(sessions.clone(), first_events);
 
@@ -161,7 +164,10 @@ async fn acp_session_binding_survives_bridge_restart_and_restores_conversation()
     .expect("first turn timed out")
     .expect("wait for first turn");
     assert_eq!(finished.status, RuntimeStatus::Completed);
-    first_supervisor.shutdown().await.expect("shutdown first bridge");
+    first_supervisor
+        .shutdown()
+        .await
+        .expect("shutdown first bridge");
     drop(first_supervisor);
     drop(sessions);
 
@@ -184,14 +190,14 @@ async fn acp_session_binding_survives_bridge_restart_and_restores_conversation()
         .restore_session("acp-persistent-session")
         .await
         .expect("restore ACP conversation after bridge restart");
-    assert_eq!(restored.external_session_id.as_deref(), Some(external_id.as_str()));
+    assert_eq!(
+        restored.external_session_id.as_deref(),
+        Some(external_id.as_str())
+    );
     assert_eq!(restored.status, RuntimeStatus::Completed);
 
     restored_supervisor
-        .send(
-            "acp-persistent-session",
-            "after restart".to_owned(),
-        )
+        .send("acp-persistent-session", "after restart".to_owned())
         .await
         .expect("continue restored ACP conversation");
     let continued = timeout(

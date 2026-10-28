@@ -188,10 +188,7 @@ pub trait RuntimeAdapter: Send + Sync {
     }
 
     /// Reattach an idle or completed runtime-owned conversation after bridge restart.
-    async fn restore_session(
-        &self,
-        _request: RuntimeRestoreRequest,
-    ) -> Result<(), RuntimeError> {
+    async fn restore_session(&self, _request: RuntimeRestoreRequest) -> Result<(), RuntimeError> {
         Err(RuntimeError::Capability(format!(
             "runtime {} does not support session restoration",
             self.id()

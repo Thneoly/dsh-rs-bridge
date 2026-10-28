@@ -321,7 +321,9 @@ impl RuntimeSupervisor {
         dsh_session_id: &str,
     ) -> Result<RuntimeExecutionSummary, RuntimeError> {
         self.reserve(dsh_session_id).await?;
-        let result = self.restore_session_reserved(dsh_session_id.to_owned()).await;
+        let result = self
+            .restore_session_reserved(dsh_session_id.to_owned())
+            .await;
         self.release_reservation(dsh_session_id).await;
         result
     }
