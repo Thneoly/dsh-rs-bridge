@@ -133,8 +133,8 @@ test('DSH AgentFactory restores persisted ACP conversation after bridge restart'
     compression: 'none',
   })
 
-  const unregisterTurnBoundary = ctx.sessionProjections.register(turnBoundaryProjectionDefinition)
-  const unregisterInbox = ctx.sessionProjections.register(inboxProjectionDefinition)
+  let unregisterTurnBoundary
+  let unregisterInbox
   const processConfig = {
     command,
     args: ['--stdio'],
@@ -150,17 +150,28 @@ test('DSH AgentFactory restores persisted ACP conversation after bridge restart'
   }
   let bridge
   let factory
+  let testCtx
+  const pluginFiber = ctx.plugin({
+    name: 'dsh-runtime-bridge-resume-integration-test',
+    inject: ['agents', 'sessions', 'sessionProjections', 'sessionPersistence'],
+    apply(pluginCtx) {
+      testCtx = pluginCtx
+      unregisterTurnBoundary = pluginCtx.sessionProjections.register(turnBoundaryProjectionDefinition)
+      unregisterInbox = pluginCtx.sessionProjections.register(inboxProjectionDefinition)
+      bridge = new JsonlBridgeClient(pluginCtx, processConfig)
+      factory = new BridgeAgentFactory(pluginCtx, bridge, {
+        ...processConfig,
+        runtimeId: 'acp',
+      })
+    },
+  })
+  await pluginFiber
   let firstHandle
   let resumedHandle
   const sessionId = SessionId('dsh-acp-resume-e2e')
   const cwd = resolve(process.cwd(), '..')
 
   try {
-    bridge = new JsonlBridgeClient(ctx, processConfig)
-    factory = new BridgeAgentFactory(ctx, bridge, {
-      ...processConfig,
-      runtimeId: 'acp',
-    })
     firstHandle = await factory.createAgent(ctx, {
       sessionId,
       meta: { cwd },
@@ -186,8 +197,9 @@ test('DSH AgentFactory restores persisted ACP conversation after bridge restart'
 
     // A fresh bridge process loads the JSONL binding journal and the ACP
     // adapter reattaches to the fixture agent's existing external session ID.
-    bridge = new JsonlBridgeClient(ctx, processConfig)
-    factory = new BridgeAgentFactory(ctx, bridge, {
+    // Restart just the bridge process; retain the DI-owned plugin context.
+    bridge = new JsonlBridgeClient(testCtx, processConfig)
+    factory = new BridgeAgentFactory(testCtx, bridge, {
       ...processConfig,
       runtimeId: 'acp',
     })
@@ -222,6 +234,7 @@ test('DSH AgentFactory restores persisted ACP conversation after bridge restart'
     await bridge?.shutdown().catch(() => {})
     unregisterInbox()
     unregisterTurnBoundary()
+    await pluginFiber.dispose()
     await ctx.fiber.dispose()
     rmSync(persistenceRoot, { recursive: true, force: true })
     rmSync(stateDir, { recursive: true, force: true })

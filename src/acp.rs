@@ -270,10 +270,7 @@ impl RuntimeAdapter for AcpRuntime {
         ))
     }
 
-    async fn restore_session(
-        &self,
-        request: RuntimeRestoreRequest,
-    ) -> Result<(), RuntimeError> {
+    async fn restore_session(&self, request: RuntimeRestoreRequest) -> Result<(), RuntimeError> {
         self.ensure_configured()?;
         if request.cancellation.is_cancelled() {
             return Err(RuntimeError::Lifecycle(
@@ -434,7 +431,9 @@ fn parse_acp_session_id(external_session_id: &str) -> Result<String, RuntimeErro
         RuntimeError::Protocol("external ACP session id has an invalid prefix".to_owned())
     })?;
     let (nonce, acp_session_id) = remainder.split_once(':').ok_or_else(|| {
-        RuntimeError::Protocol("external ACP session id is missing its session component".to_owned())
+        RuntimeError::Protocol(
+            "external ACP session id is missing its session component".to_owned(),
+        )
     })?;
     if nonce.parse::<u64>().is_err() || acp_session_id.trim().is_empty() {
         return Err(RuntimeError::Protocol(

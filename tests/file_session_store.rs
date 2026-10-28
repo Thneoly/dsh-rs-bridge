@@ -3,16 +3,20 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use dsh_rs_bridge::{FileSessionStore, RuntimeError, RuntimeSessionRecord, RuntimeStatus, SessionStore};
+use dsh_rs_bridge::{
+    FileSessionStore, RuntimeError, RuntimeSessionRecord, RuntimeStatus, SessionStore,
+};
 
 static NEXT_PATH: AtomicU64 = AtomicU64::new(1);
 
 fn journal_path() -> PathBuf {
-    std::env::temp_dir().join(format!(
-        "dsh-rs-bridge-file-store-{}-{}",
-        std::process::id(),
-        NEXT_PATH.fetch_add(1, Ordering::Relaxed)
-    )).join("sessions.jsonl")
+    std::env::temp_dir()
+        .join(format!(
+            "dsh-rs-bridge-file-store-{}-{}",
+            std::process::id(),
+            NEXT_PATH.fetch_add(1, Ordering::Relaxed)
+        ))
+        .join("sessions.jsonl")
 }
 
 fn record(session_id: &str) -> RuntimeSessionRecord {
@@ -30,7 +34,9 @@ fn record(session_id: &str) -> RuntimeSessionRecord {
 #[tokio::test]
 async fn file_store_replays_latest_binding_and_repairs_torn_tail() {
     let path = journal_path();
-    let store = FileSessionStore::open(&path).await.expect("open new journal");
+    let store = FileSessionStore::open(&path)
+        .await
+        .expect("open new journal");
     let initial = record("session-persisted");
     store.create(initial.clone()).await.expect("create record");
 
@@ -66,7 +72,10 @@ async fn file_store_replays_latest_binding_and_repairs_torn_tail() {
     );
 
     let bytes = tokio::fs::read(&path).await.expect("read repaired journal");
-    assert!(bytes.ends_with(b"\n"), "journal must end at a complete record boundary");
+    assert!(
+        bytes.ends_with(b"\n"),
+        "journal must end at a complete record boundary"
+    );
     let text = String::from_utf8(bytes).expect("journal is UTF-8");
     assert_eq!(text.lines().count(), 2, "torn tail must be removed");
     tokio::fs::remove_dir_all(path.parent().expect("journal parent"))
@@ -98,7 +107,6 @@ async fn file_store_rejects_duplicate_create_and_missing_update() {
         .expect("remove temporary journal directory");
 }
 
-
 #[tokio::test]
 async fn file_store_repairs_missing_delimiter_before_appending_next_record() {
     let path = journal_path();
@@ -125,7 +133,10 @@ async fn file_store_repairs_missing_delimiter_before_appending_next_record() {
         .expect("record");
     updated.status = RuntimeStatus::Completed;
     updated.updated_at_ms = 30;
-    reopened.update(updated.clone()).await.expect("append update");
+    reopened
+        .update(updated.clone())
+        .await
+        .expect("append update");
     drop(reopened);
 
     let content = tokio::fs::read_to_string(&path)

@@ -176,7 +176,6 @@ fn stdio_protocol_returns_correlated_errors_for_unknown_methods() {
     bridge.shutdown();
 }
 
-
 impl Drop for BridgeProcess {
     fn drop(&mut self) {
         if self.child.try_wait().ok().flatten().is_none() {

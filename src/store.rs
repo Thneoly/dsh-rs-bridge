@@ -14,10 +14,8 @@ use crate::contracts::{
 #[async_trait]
 pub trait SessionStore: Send + Sync {
     async fn create(&self, record: RuntimeSessionRecord) -> Result<(), RuntimeError>;
-    async fn get(
-        &self,
-        dsh_session_id: &str,
-    ) -> Result<Option<RuntimeSessionRecord>, RuntimeError>;
+    async fn get(&self, dsh_session_id: &str)
+        -> Result<Option<RuntimeSessionRecord>, RuntimeError>;
     async fn update(&self, record: RuntimeSessionRecord) -> Result<(), RuntimeError>;
 }
 
@@ -85,7 +83,10 @@ pub struct FileSessionStore {
 impl FileSessionStore {
     pub async fn open(path: impl Into<PathBuf>) -> Result<Self, RuntimeError> {
         let path = path.into();
-        if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
             tokio::fs::create_dir_all(parent).await.map_err(|error| {
                 RuntimeError::Persistence(format!(
                     "create session-store directory {}: {error}",
@@ -142,16 +143,17 @@ impl FileSessionStore {
             } else {
                 // The JSON object itself survived but the final newline did not.
                 // Restore the record delimiter before any later append.
-                let mut file = OpenOptions::new()
-                    .append(true)
-                    .open(&path)
-                    .await
-                    .map_err(|error| {
-                        RuntimeError::Persistence(format!(
-                            "open complete session journal tail {}: {error}",
-                            path.display()
-                        ))
-                    })?;
+                let mut file =
+                    OpenOptions::new()
+                        .append(true)
+                        .open(&path)
+                        .await
+                        .map_err(|error| {
+                            RuntimeError::Persistence(format!(
+                                "open complete session journal tail {}: {error}",
+                                path.display()
+                            ))
+                        })?;
                 file.write_all(b"\n").await.map_err(|error| {
                     RuntimeError::Persistence(format!(
                         "repair session journal delimiter {}: {error}",
@@ -207,7 +209,11 @@ impl FileSessionStore {
     }
 
     async fn append_record(&self, record: &RuntimeSessionRecord) -> Result<(), RuntimeError> {
-        if let Some(parent) = self.path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+        if let Some(parent) = self
+            .path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
             tokio::fs::create_dir_all(parent).await.map_err(|error| {
                 RuntimeError::Persistence(format!(
                     "create session-store directory {}: {error}",
