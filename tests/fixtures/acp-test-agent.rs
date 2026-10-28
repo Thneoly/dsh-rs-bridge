@@ -61,8 +61,11 @@ fn main() {
                     .to_owned();
                 let Some(id) = id else { continue };
                 if prompt_session != session_id.as_str() {
-                    send(&mut stdout, json!({"jsonrpc":"2.0","id":id,
-                        "error":{"code":-32001,"message":"unknown session"}}));
+                    send(
+                        &mut stdout,
+                        json!({"jsonrpc":"2.0","id":id,
+                        "error":{"code":-32001,"message":"unknown session"}}),
+                    );
                     continue;
                 }
                 if prompt == "cancel-me" {
