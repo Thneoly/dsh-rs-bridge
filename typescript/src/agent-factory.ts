@@ -509,16 +509,18 @@ class RemoteRuntimeAgent implements Agent {
             model: this.runtimeId,
           },
         })
-        settlementSeq = this.session.append('assistant/message', {
+        const settlementEvent = this.session.append('assistant/message', {
           turn,
           step,
           message: assistantMessage,
           stream,
           ...(terminalStatus === 'cancelled' ? { interrupted: true as const } : {}),
         }, { surfaceOp: 'append' })
+        settlementSeq = settlementEvent.seq
         eventType = 'assistant/message'
       } else {
-        settlementSeq = this.session.append('assistant/attempt', { turn, step, stream })
+        const settlementEvent = this.session.append('assistant/attempt', { turn, step, stream })
+        settlementSeq = settlementEvent.seq
         eventType = 'assistant/attempt'
       }
 
