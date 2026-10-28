@@ -106,3 +106,33 @@ resumed agent. A subsequent prompt continues the same external ACP session.
 The TypeScript AgentFactory now supports `resume({ resumeSessionId })` using
 the DSH JSONL persistence backend. The Rust binding journal and DSH session log
 must both be retained for full cross-process restoration.
+
+## Real ACP agent end-to-end check (opt-in)
+
+The ordinary CI smoke launches a real OpenCode ACP binary and verifies
+`initialize` + `session/new` **without requiring credentials**. This proves
+the agent handshake, not model generation.
+
+To verify the full Rust bridge → real ACP agent → model → event stream loop,
+first configure authentication with the agent's documented login/API-key
+procedure. Use a disposable workspace and a low-cost model. Then run:
+
+```bash
+cargo build --bin dsh-rs-bridge
+export DSH_RS_BRIDGE_BIN="$PWD/target/debug/dsh-rs-bridge"
+export DSH_RS_BRIDGE_ACP_COMMAND="$(command -v opencode)"
+export DSH_RS_BRIDGE_ACP_ARGS='["acp"]'
+node scripts/bridge-acp-e2e.mjs
+```
+
+On Windows PowerShell set `DSH_RS_BRIDGE_BIN` to the built `.exe`,
+`DSH_RS_BRIDGE_ACP_COMMAND` to the agent executable, and
+`DSH_RS_BRIDGE_ACP_ARGS` to a JSON array as above.
+
+The opt-in script checks successful execution of two distinct prompts,
+streaming `assistant.delta`, terminal events, and preservation of the
+external session identity across turns. It does not log prompt text,
+generated content, session IDs, or API keys. It fails when auth, protocol,
+model selection, or execution is incompatible; this credentialed check is
+**not run by ordinary CI**. The bridge currently declines ACP permission
+requests, so use non-mutating prompts for this validation.

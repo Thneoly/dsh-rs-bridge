@@ -20,7 +20,6 @@ import { createScope, scopeTarget } from '@deepseek-ai/dsh-scope'
 import type { Scope } from '@deepseek-ai/dsh-scope'
 import {
   interruptedTurnClosers,
-  SessionLogOffset,
   SessionPreparation,
   SessionSeq,
 } from '@deepseek-ai/dsh-session'
@@ -56,7 +55,6 @@ export interface RuntimeBridgeFactoryConfig extends BridgeProcessConfig {
 
 interface StoredSession {
   handle: SessionHandle
-  storedCount: number
 }
 
 function abortError(signal: AbortSignal, label: string): Error {
@@ -561,7 +559,6 @@ class RemoteRuntimeAgent implements Agent {
           },
         })
       }
-      await this.appendUnstoredSuffix()
     } catch (error) {
       if (!streamEnded) {
         this.notify('agent/assistant-stream', {
@@ -584,13 +581,7 @@ class RemoteRuntimeAgent implements Agent {
     return this.cancelCause
   }
 
-  private async appendUnstoredSuffix(): Promise<void> {
-    if (this.stored === undefined) return
-    const suffix = this.session.snapshotEvents(SessionLogOffset(this.stored.storedCount))
-    if (suffix.length === 0) return
-    await this.stored.handle.append(suffix)
-    this.stored.storedCount += suffix.length
-  }
+
 }
 
 /** AgentFactory that maps DSH Agent turns onto a selected Rust Runtime Adapter. */
@@ -689,7 +680,6 @@ export class BridgeAgentFactory implements AgentFactory {
           'agent setup cancelled',
         )
         setupCommit?.commit()
-        await this.appendUnstoredSuffix(stored, session)
         lifecycleSignal.throwIfAborted()
         detachSession = agent.ctx.sessions.enter(session)
         detachAgent = this.ctx.agents.enter(agent, options.parentAgent)
@@ -761,9 +751,8 @@ export class BridgeAgentFactory implements AgentFactory {
         eventState: coldRead.eventState,
       }))
       const session = preparation.session
-      stored = { handle: openedHandle, storedCount: persisted.length + closers.length }
+      stored = { handle: openedHandle }
       openedHandle = undefined
-      await this.appendUnstoredSuffix(stored, session)
 
       const restored = await raceAbort(
         this.bridge.request<RuntimeExecutionSummary>('session.restore', {
@@ -857,7 +846,6 @@ export class BridgeAgentFactory implements AgentFactory {
           'resumed agent setup cancelled',
         )
         setupCommit?.commit()
-        await this.appendUnstoredSuffix(stored, session)
         lifecycleSignal.throwIfAborted()
         detachSession = agent.ctx.sessions.enter(session)
         detachAgent = this.ctx.agents.enter(agent, options.parentAgent)
@@ -898,17 +886,8 @@ export class BridgeAgentFactory implements AgentFactory {
       inheritedEventCount: session.inheritedEventCount,
       ...(signal === undefined ? {} : { signal }),
     })
-    return { handle, storedCount: 0 }
+    return { handle }
   }
 
-  private async appendUnstoredSuffix(
-    stored: StoredSession | undefined,
-    session: Session,
-  ): Promise<void> {
-    if (stored === undefined) return
-    const suffix = session.snapshotEvents(SessionLogOffset(stored.storedCount))
-    if (suffix.length === 0) return
-    await stored.handle.append(suffix)
-    stored.storedCount += suffix.length
-  }
+
 }
