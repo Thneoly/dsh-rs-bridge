@@ -5,10 +5,9 @@ use serde_json::json;
 use tokio::sync::{mpsc, Mutex};
 
 use crate::contracts::{
-    RuntimeAdapter, RuntimeCapabilities, RuntimeError, RuntimeEvent, RuntimeEventType,
-    RuntimeContinueRequest, RuntimeHealth, RuntimeHealthStatus, RuntimeResumeRequest,
-    RuntimeSendRequest, RuntimeSessionControl, RuntimeSessionHandle, RuntimeStartRequest,
-    RuntimeStatus,
+    RuntimeAdapter, RuntimeCapabilities, RuntimeContinueRequest, RuntimeError, RuntimeEvent,
+    RuntimeEventType, RuntimeHealth, RuntimeHealthStatus, RuntimeResumeRequest, RuntimeSendRequest,
+    RuntimeSessionControl, RuntimeSessionHandle, RuntimeStartRequest, RuntimeStatus,
 };
 
 #[derive(Clone)]
