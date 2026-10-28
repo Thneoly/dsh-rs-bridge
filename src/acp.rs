@@ -25,8 +25,9 @@ use tokio::{
 
 use crate::contracts::{
     RuntimeAdapter, RuntimeCapabilities, RuntimeContinueRequest, RuntimeError, RuntimeEvent,
-    RuntimeEventType, RuntimeHealth, RuntimeHealthStatus, RuntimeResumeRequest, RuntimeSendRequest,
-    RuntimeSessionControl, RuntimeSessionHandle, RuntimeStartRequest,
+    RuntimeEventType, RuntimeHealth, RuntimeHealthStatus, RuntimeRestoreRequest,
+    RuntimeResumeRequest, RuntimeSendRequest, RuntimeSessionControl, RuntimeSessionHandle,
+    RuntimeStartRequest,
 };
 
 const ACP_PROTOCOL_VERSION: u64 = 1;
@@ -200,9 +201,9 @@ impl RuntimeAdapter for AcpRuntime {
     fn capabilities(&self) -> RuntimeCapabilities {
         RuntimeCapabilities {
             streaming_events: true,
-            // A new bridge process cannot yet reconstruct the ACP process/session
-            // binding. Keep this false until durable binding storage is implemented.
+            // ACP session restoration reattaches a conversation, not an in-flight turn.
             resume: false,
+            session_restore: true,
             interrupt: true,
             // ACP v1 prompt is a request/turn, not an in-flight steering channel.
             live_input: false,
@@ -269,6 +270,131 @@ impl RuntimeAdapter for AcpRuntime {
         ))
     }
 
+    async fn restore_session(
+        &self,
+        request: RuntimeRestoreRequest,
+    ) -> Result<(), RuntimeError> {
+        self.ensure_configured()?;
+        if request.cancellation.is_cancelled() {
+            return Err(RuntimeError::Lifecycle(
+                "ACP session restoration cancelled before process launch".to_owned(),
+            ));
+        }
+        let existing = self
+            .sessions
+            .lock()
+            .await
+            .get(&request.external_session_id)
+            .cloned();
+        if let Some(existing) = existing {
+            if !existing.process.stopped.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            self.sessions
+                .lock()
+                .await
+                .remove(&request.external_session_id);
+        }
+
+        let acp_session_id = parse_acp_session_id(&request.external_session_id)?;
+        let cwd = resolve_cwd(request.cwd.as_deref(), self.config.cwd.as_deref())?;
+        let process = AcpProcess::spawn(&self.config, &cwd).await?;
+        let initialized = match process
+            .request(
+                "initialize",
+                json!({
+                    "protocolVersion": ACP_PROTOCOL_VERSION,
+                    "clientInfo": {
+                        "name": "dsh-rs-bridge",
+                        "version": env!("CARGO_PKG_VERSION")
+                    },
+                    "clientCapabilities": {}
+                }),
+            )
+            .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                process.stop().await;
+                return Err(error);
+            }
+        };
+
+        if initialized.get("protocolVersion").and_then(Value::as_u64) != Some(ACP_PROTOCOL_VERSION)
+        {
+            process.stop().await;
+            return Err(RuntimeError::Protocol(format!(
+                "ACP protocol version mismatch during restore: expected {ACP_PROTOCOL_VERSION}, received {}",
+                initialized
+                    .get("protocolVersion")
+                    .map(Value::to_string)
+                    .unwrap_or_else(|| "missing".to_owned())
+            )));
+        }
+
+        let agent_capabilities = initialized
+            .get("agentCapabilities")
+            .cloned()
+            .unwrap_or(Value::Null);
+        let supports_resume = agent_capabilities
+            .get("sessionCapabilities")
+            .and_then(|value| value.get("resume"))
+            .is_some_and(|value| !value.is_null());
+        let supports_load = agent_capabilities
+            .get("loadSession")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let method = if supports_resume {
+            "session/resume"
+        } else if supports_load {
+            "session/load"
+        } else {
+            process.stop().await;
+            return Err(RuntimeError::Capability(
+                "ACP agent does not advertise session/resume or loadSession".to_owned(),
+            ));
+        };
+
+        let restored = process
+            .request(
+                method,
+                json!({
+                    "sessionId": acp_session_id,
+                    "cwd": cwd.to_string_lossy(),
+                    "mcpServers": []
+                }),
+            )
+            .await;
+        if let Err(error) = restored {
+            process.stop().await;
+            return Err(error);
+        }
+        if request.cancellation.is_cancelled() {
+            process.stop().await;
+            return Err(RuntimeError::Lifecycle(
+                "ACP session restoration cancelled after external attach".to_owned(),
+            ));
+        }
+
+        let session = Arc::new(AcpSession {
+            external_session_id: request.external_session_id.clone(),
+            acp_session_id,
+            process,
+            turn_lock: Arc::new(Mutex::new(())),
+            next_turn_id: AtomicU64::new(1),
+        });
+        let mut sessions = self.sessions.lock().await;
+        if sessions.contains_key(&request.external_session_id) {
+            session.shutdown().await;
+            return Err(RuntimeError::Lifecycle(format!(
+                "ACP session was attached concurrently: {}",
+                request.external_session_id
+            )));
+        }
+        sessions.insert(request.external_session_id, session);
+        Ok(())
+    }
+
     async fn continue_session(
         &self,
         request: RuntimeContinueRequest,
@@ -301,6 +427,21 @@ impl RuntimeAdapter for AcpRuntime {
         }
         Ok(())
     }
+}
+
+fn parse_acp_session_id(external_session_id: &str) -> Result<String, RuntimeError> {
+    let remainder = external_session_id.strip_prefix("acp:").ok_or_else(|| {
+        RuntimeError::Protocol("external ACP session id has an invalid prefix".to_owned())
+    })?;
+    let (nonce, acp_session_id) = remainder.split_once(':').ok_or_else(|| {
+        RuntimeError::Protocol("external ACP session id is missing its session component".to_owned())
+    })?;
+    if nonce.parse::<u64>().is_err() || acp_session_id.trim().is_empty() {
+        return Err(RuntimeError::Protocol(
+            "external ACP session id is malformed".to_owned(),
+        ));
+    }
+    Ok(acp_session_id.to_owned())
 }
 
 fn resolve_cwd(
@@ -608,10 +749,10 @@ impl AcpProcess {
         method: &str,
         response_rx: oneshot::Receiver<Result<Value, RuntimeError>>,
     ) -> Result<Value, RuntimeError> {
-        let limit = if method == "session/prompt" {
-            PROMPT_TIMEOUT
-        } else {
-            REQUEST_TIMEOUT
+        let limit = match method {
+            "session/prompt" => PROMPT_TIMEOUT,
+            "session/load" => Duration::from_secs(120),
+            _ => REQUEST_TIMEOUT,
         };
         match timeout(limit, response_rx).await {
             Ok(Ok(result)) => result,

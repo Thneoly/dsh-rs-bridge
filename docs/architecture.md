@@ -73,3 +73,22 @@ notifications. The adapter does not fabricate DSH `tool/call` and
 `tool/result` records from another runtime's internal tool cycle, because DSH's
 durable tool-call semantics are tied to assistant tool-call blocks and matching
 call/result identities.
+
+
+## Durable bindings and conversation restoration
+
+The executable defaults to a file-backed session binding journal under
+`.dsh-rs-bridge/sessions.jsonl`; `DSH_RS_BRIDGE_STATE_DIR` overrides the root.
+The journal is append-only JSONL with a versioned record envelope, sync-on-write
+durability, latest-record replay, and torn-tail repair. The persisted record
+contains the DSH session ID, runtime ID, opaque external session ID, status,
+timestamps, and optional working directory.
+
+`session.restore` is distinct from `session.resume`: the former reconnects an
+idle conversation after the bridge process restarts, while the latter remains
+the active-execution recovery contract. For ACP v1, restoration prefers
+`session/resume` when advertised and falls back to `session/load` when
+`loadSession` is advertised. A previous `starting` or `running` record is
+closed as failed because the bridge cannot safely reconstruct the old in-flight
+turn. DSH history is repaired and restored separately by the TypeScript
+AgentFactory before the agent is published.

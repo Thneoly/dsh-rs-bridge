@@ -34,7 +34,7 @@ Per-agent engine selection is available through the merge-extensible DSH `AgentO
 - Each external execution maps to one DSH turn and one step. User input, assistant output, step/turn boundaries, inbox splices, and terminal status are written to the DSH Session.
 - Assistant deltas are published as transient `agent/assistant-stream` start/chunk/end frames and compacted into the final durable `assistant/message` or `assistant/attempt` event.
 - External `tool.*` events are surfaced as transient `agent/runtime-event` notifications. They are deliberately not rewritten as DSH `tool/call` / `tool/result` events because an external agent's internal tool cycle is not necessarily a DSH model tool-call cycle.
-- `AgentFactory.resume()` is intentionally rejected for now: the Rust bridge stores DSH-to-external session bindings in memory. Durable binding storage must be implemented before DSH persisted-session resume can be reliable.
+- `AgentFactory.resume()` opens the existing DSH JSONL session for write, repairs an interrupted final turn, restores the Rust bridge binding, and reattaches the existing external conversation. The Rust binding journal and DSH session-persistence root must both survive restart.
 - The Rust bridge always registers the deterministic `mock` runtime and can optionally register an ACP v1 subprocess runtime through `DSH_RS_BRIDGE_ACP_COMMAND`. Vendor-specific Claude CLI and CodeAgent adapters remain future work.
 - This plugin replaces DSH's Native AgentLoop factory for its configured agents; do not load both factories in one DSH context.
 
@@ -60,3 +60,18 @@ External tool lifecycle events are published transiently through
 the runtime ID, external session ID, event type, optional runtime sequence,
 payload, and timestamp. This avoids inventing DSH model tool-call/result
 semantics for tools executed internally by another agent runtime.
+
+
+## Resuming a persisted DSH agent
+
+Mount `@deepseek-ai/dsh-session-persistence-jsonl` alongside the Session
+service and keep its root stable across process restarts. Configure the bridge
+with a stable `DSH_RS_BRIDGE_STATE_DIR`. Call
+`ctx.agents.resume({ resumeSessionId })` after creating a fresh Context and
+bridge process. The factory loads and repairs the DSH event log, invokes
+`session.restore` to reconnect the external conversation, and publishes the
+resumed Agent with the same DSH and external session identities.
+
+An interrupted in-flight model turn is not replayed automatically. Its DSH
+history is closed with the standard interrupted-turn repair events; the next
+user prompt starts a new turn on the restored conversation.

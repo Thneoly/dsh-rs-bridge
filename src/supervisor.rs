@@ -14,8 +14,9 @@ use tokio_util::sync::CancellationToken;
 use crate::contracts::{
     ExecutionEventEnvelope, ResumeExecutionRequest, RuntimeAdapter, RuntimeCapabilities,
     RuntimeContinueRequest, RuntimeDescriptor, RuntimeError, RuntimeEvent, RuntimeExecutionSummary,
-    RuntimeHealthStatus, RuntimeResumeRequest, RuntimeSessionControl, RuntimeSessionHandle,
-    RuntimeSessionRecord, RuntimeStartRequest, RuntimeStatus, StartExecutionRequest,
+    RuntimeHealthStatus, RuntimeRestoreRequest, RuntimeResumeRequest, RuntimeSessionControl,
+    RuntimeSessionHandle, RuntimeSessionRecord, RuntimeStartRequest, RuntimeStatus,
+    StartExecutionRequest,
 };
 use crate::store::{ExecutionEventSink, SessionStore};
 
@@ -202,6 +203,7 @@ impl RuntimeSupervisor {
             dsh_session_id: request.dsh_session_id.clone(),
             runtime_id: adapter.id().to_owned(),
             external_session_id: None,
+            cwd: request.cwd.clone(),
             status: RuntimeStatus::Starting,
             created_at_ms: stamp,
             updated_at_ms: stamp,
@@ -310,6 +312,111 @@ impl RuntimeSupervisor {
         let result = self.resume_reserved(request.clone()).await;
         self.release_reservation(&request.dsh_session_id).await;
         result
+    }
+
+    /// Reattach an existing runtime-owned conversation without claiming that an
+    /// interrupted in-flight turn itself can be resumed.
+    pub async fn restore_session(
+        &self,
+        dsh_session_id: &str,
+    ) -> Result<RuntimeExecutionSummary, RuntimeError> {
+        self.reserve(dsh_session_id).await?;
+        let result = self.restore_session_reserved(dsh_session_id.to_owned()).await;
+        self.release_reservation(dsh_session_id).await;
+        result
+    }
+
+    async fn restore_session_reserved(
+        &self,
+        dsh_session_id: String,
+    ) -> Result<RuntimeExecutionSummary, RuntimeError> {
+        let mut record = self
+            .inner
+            .sessions
+            .get(&dsh_session_id)
+            .await?
+            .ok_or_else(|| RuntimeError::NotFound(format!("DSH session: {dsh_session_id}")))?;
+        let external_id = record.external_session_id.clone().ok_or_else(|| {
+            RuntimeError::Lifecycle(format!(
+                "external session reference missing: {dsh_session_id}"
+            ))
+        })?;
+        if self.inner.active.lock().await.contains_key(&dsh_session_id) {
+            return Err(RuntimeError::Lifecycle(format!(
+                "cannot restore an already active DSH session: {dsh_session_id}"
+            )));
+        }
+        let adapter = self.require_adapter(&record.runtime_id)?;
+        if !adapter.capabilities().session_restore {
+            return Err(RuntimeError::Capability(format!(
+                "runtime {} does not support session restoration",
+                adapter.id()
+            )));
+        }
+
+        let previous_status = record.status;
+        if !record.status.is_terminal() {
+            record.status = RuntimeStatus::Failed;
+            record.updated_at_ms = now_ms();
+            self.inner.sessions.update(record.clone()).await?;
+            self.inner
+                .events
+                .append(envelope(
+                    &record,
+                    "runtime.interrupted",
+                    None,
+                    json!({
+                        "previous_status": previous_status,
+                        "reason": "bridge restarted; the in-flight turn cannot be resumed"
+                    }),
+                ))
+                .await?;
+        }
+
+        if let Err(error) = adapter
+            .restore_session(RuntimeRestoreRequest {
+                dsh_session_id: dsh_session_id.clone(),
+                external_session_id: external_id.clone(),
+                cwd: record.cwd.clone(),
+                cancellation: CancellationToken::new(),
+            })
+            .await
+        {
+            record.status = RuntimeStatus::Failed;
+            record.updated_at_ms = now_ms();
+            let _ = self.inner.sessions.update(record.clone()).await;
+            let _ = self
+                .inner
+                .events
+                .append(envelope(
+                    &record,
+                    "runtime.restore_failed",
+                    None,
+                    json!({ "message": error.to_string() }),
+                ))
+                .await;
+            return Err(error);
+        }
+
+        self.inner
+            .events
+            .append(envelope(
+                &record,
+                "runtime.session_restored",
+                None,
+                json!({
+                    "external_session_id": external_id,
+                    "status": record.status
+                }),
+            ))
+            .await?;
+
+        Ok(RuntimeExecutionSummary {
+            dsh_session_id,
+            runtime_id: adapter.id().to_owned(),
+            external_session_id: Some(external_id),
+            status: record.status,
+        })
     }
 
     async fn resume_reserved(

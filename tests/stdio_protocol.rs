@@ -1,12 +1,17 @@
 use std::{
     io::{BufRead, BufReader, Write},
+    path::PathBuf,
     process::{Child, ChildStdin, ChildStdout, Command, Stdio},
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 use serde_json::{json, Value};
 
+static NEXT_STATE_DIR: AtomicU64 = AtomicU64::new(1);
+
 struct BridgeProcess {
     child: Child,
+    state_dir: PathBuf,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
     notifications: Vec<Value>,
@@ -14,9 +19,16 @@ struct BridgeProcess {
 
 impl BridgeProcess {
     fn spawn() -> Self {
+        let state_dir = std::env::temp_dir().join(format!(
+            "dsh-rs-bridge-stdio-test-{}-{}",
+            std::process::id(),
+            NEXT_STATE_DIR.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&state_dir).expect("create isolated bridge state directory");
         let mut child = Command::new(env!("CARGO_BIN_EXE_dsh-rs-bridge"))
             .arg("--stdio")
             .env("DSH_RS_BRIDGE_MOCK_DELAY_MS", "1")
+            .env("DSH_RS_BRIDGE_STATE_DIR", &state_dir)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -27,6 +39,7 @@ impl BridgeProcess {
         let stdout = BufReader::new(child.stdout.take().expect("bridge stdout"));
         Self {
             child,
+            state_dir,
             stdin,
             stdout,
             notifications: Vec::new(),
@@ -161,4 +174,15 @@ fn stdio_protocol_returns_correlated_errors_for_unknown_methods() {
         .contains("unknown method"));
 
     bridge.shutdown();
+}
+
+
+impl Drop for BridgeProcess {
+    fn drop(&mut self) {
+        if self.child.try_wait().ok().flatten().is_none() {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+        let _ = std::fs::remove_dir_all(&self.state_dir);
+    }
 }

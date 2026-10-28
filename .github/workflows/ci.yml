@@ -34,7 +34,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build bridge executable for DSH integration test
-        run: cargo build --bin dsh-rs-bridge
+        run: cargo build --bin dsh-rs-bridge --bin acp-test-agent
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -50,6 +50,7 @@ jobs:
         working-directory: typescript
         env:
           DSH_RS_BRIDGE_BIN: ${{ github.workspace }}/target/debug/dsh-rs-bridge
+          DSH_RS_BRIDGE_ACP_TEST_BIN: ${{ github.workspace }}/target/debug/acp-test-agent
         run: npm test
 
   real-acp-smoke:

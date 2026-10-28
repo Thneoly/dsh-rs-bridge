@@ -80,7 +80,10 @@ pub struct RuntimeEvent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeCapabilities {
     pub streaming_events: bool,
+    /// Resume an interrupted execution rather than only reattaching its session.
     pub resume: bool,
+    /// Reattach an existing runtime-owned conversation after the bridge restarts.
+    pub session_restore: bool,
     pub interrupt: bool,
     /// Accept steering/follow-up input while an execution is still active.
     pub live_input: bool,
@@ -122,6 +125,16 @@ pub struct RuntimeResumeRequest {
     pub dsh_session_id: String,
     /// Runtime-owned identity, persisted separately from the DSH session ID.
     pub external_session_id: String,
+    pub cancellation: CancellationToken,
+}
+
+#[derive(Debug, Clone)]
+pub struct RuntimeRestoreRequest {
+    pub dsh_session_id: String,
+    /// Runtime-owned identity persisted by the bridge session store.
+    pub external_session_id: String,
+    /// Absolute working directory used to reconstruct the external conversation.
+    pub cwd: Option<String>,
     pub cancellation: CancellationToken,
 }
 
@@ -169,7 +182,18 @@ pub trait RuntimeAdapter: Send + Sync {
         _request: RuntimeResumeRequest,
     ) -> Result<RuntimeSessionHandle, RuntimeError> {
         Err(RuntimeError::Capability(format!(
-            "runtime {} does not implement resume",
+            "runtime {} does not implement execution resume",
+            self.id()
+        )))
+    }
+
+    /// Reattach an idle or completed runtime-owned conversation after bridge restart.
+    async fn restore_session(
+        &self,
+        _request: RuntimeRestoreRequest,
+    ) -> Result<(), RuntimeError> {
+        Err(RuntimeError::Capability(format!(
+            "runtime {} does not support session restoration",
             self.id()
         )))
     }
@@ -195,6 +219,9 @@ pub struct RuntimeSessionRecord {
     pub dsh_session_id: String,
     pub runtime_id: String,
     pub external_session_id: Option<String>,
+    /// Working directory captured at session creation when supplied by the host.
+    #[serde(default)]
+    pub cwd: Option<String>,
     pub status: RuntimeStatus,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,

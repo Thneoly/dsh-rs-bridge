@@ -39,7 +39,10 @@ fn main() {
                         json!({
                             "protocolVersion": 1,
                             "agentInfo": {"name": "acp-test-agent", "version": "0.1.0"},
-                            "agentCapabilities": {"loadSession": true}
+                            "agentCapabilities": {
+                                "loadSession": true,
+                                "sessionCapabilities": { "resume": {} }
+                            }
                         }),
                     );
                 }
@@ -49,6 +52,29 @@ fn main() {
                 session_id = format!("fixture-session-{next_session}");
                 if let Some(id) = id {
                     respond(&mut stdout, id, json!({"sessionId":session_id.clone()}));
+                }
+            }
+            "session/resume" => {
+                let requested_session = message["params"]["sessionId"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned();
+                if requested_session.trim().is_empty() {
+                    if let Some(id) = id {
+                        send(
+                            &mut stdout,
+                            json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "error": { "code": -32602, "message": "sessionId is required" }
+                            }),
+                        );
+                    }
+                    continue;
+                }
+                session_id = requested_session;
+                if let Some(id) = id {
+                    respond(&mut stdout, id, json!({}));
                 }
             }
             "session/prompt" => {

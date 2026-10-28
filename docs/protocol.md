@@ -66,3 +66,20 @@ frames and compacted into the final durable `assistant/message` /
 the transient `agent/runtime-event` event with the original runtime envelope.
 They are not currently converted into durable DSH `tool/call` and
 `tool/result` records.
+
+
+## Session restoration RPC
+
+`session.restore` accepts `{ "dsh_session_id": "..." }`. It looks up the
+persisted runtime binding, reattaches the external conversation when the
+adapter supports session restoration, and returns the original runtime and
+external session IDs. It does not start a prompt. If the prior record was
+`starting` or `running`, the bridge marks that old execution failed and emits
+`runtime.interrupted`; successful reattachment emits
+`runtime.session_restored`. The next `session.send` can start a new turn on
+the restored conversation.
+
+The default binding journal is `.dsh-rs-bridge/sessions.jsonl`; configure
+`DSH_RS_BRIDGE_STATE_DIR` to keep it in a stable deployment directory. The
+journal is separate from DSH's own durable session event log. Both stores are
+required to reconstruct the full agent session.

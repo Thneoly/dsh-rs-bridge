@@ -1,15 +1,19 @@
 use std::{
     collections::HashMap,
     io::{BufRead, BufReader, Write},
+    path::PathBuf,
     process::{Child, ChildStdin, ChildStdout, Command, Stdio},
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 use serde_json::{json, Value};
 
 const PROTOCOL: &str = "dsh.runtime.v1";
+static NEXT_STATE_DIR: AtomicU64 = AtomicU64::new(1);
 
 struct BridgeProcess {
     child: Child,
+    state_dir: PathBuf,
     stdin: Option<ChildStdin>,
     stdout: BufReader<ChildStdout>,
     next_id: u64,
@@ -18,9 +22,16 @@ struct BridgeProcess {
 
 impl BridgeProcess {
     fn spawn() -> Self {
+        let state_dir = std::env::temp_dir().join(format!(
+            "dsh-rs-bridge-process-test-{}-{}",
+            std::process::id(),
+            NEXT_STATE_DIR.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&state_dir).expect("create isolated bridge state directory");
         let mut child = Command::new(env!("CARGO_BIN_EXE_dsh-rs-bridge"))
             .arg("--stdio")
             .env("DSH_RS_BRIDGE_MOCK_DELAY_MS", "60")
+            .env("DSH_RS_BRIDGE_STATE_DIR", &state_dir)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -30,6 +41,7 @@ impl BridgeProcess {
         let stdout = BufReader::new(child.stdout.take().expect("child stdout"));
         Self {
             child,
+            state_dir,
             stdin: Some(stdin),
             stdout,
             next_id: 0,
@@ -82,6 +94,7 @@ impl BridgeProcess {
         self.stdin.take();
         let status = self.child.wait().expect("wait for bridge exit");
         assert!(status.success(), "bridge exited unsuccessfully: {status}");
+        let _ = std::fs::remove_dir_all(&self.state_dir);
     }
 }
 
@@ -91,6 +104,7 @@ impl Drop for BridgeProcess {
             let _ = self.child.kill();
             let _ = self.child.wait();
         }
+        let _ = std::fs::remove_dir_all(&self.state_dir);
     }
 }
 

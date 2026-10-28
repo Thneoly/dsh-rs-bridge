@@ -41,6 +41,7 @@ export interface RuntimeDescriptor {
   capabilities: {
     streaming_events: boolean
     resume: boolean
+    session_restore: boolean
     interrupt: boolean
     live_input: boolean
     continuation: boolean
