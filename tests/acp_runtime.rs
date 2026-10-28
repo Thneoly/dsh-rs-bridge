@@ -33,7 +33,10 @@ async fn acp_subprocess_streams_output_continues_and_cancels() {
         .await
         .expect("start ACP session");
     assert_eq!(first.status, RuntimeStatus::Running);
-    let first_external_id = first.external_session_id.clone().expect("external session id");
+    let first_external_id = first
+        .external_session_id
+        .clone()
+        .expect("external session id");
     let finished = supervisor
         .wait_for_terminal("acp-session-1")
         .await
@@ -63,11 +66,18 @@ async fn acp_subprocess_streams_output_continues_and_cancels() {
         .await
         .expect("session store")
         .expect("session record");
-    assert_eq!(record.external_session_id.as_deref(), Some(first_external_id.as_str()));
-    assert!(events.events_for("acp-session-1").await.iter().any(|event| {
-        event.event.event_type == "assistant.delta"
-            && event.event.payload["text"] == "ACP says: second prompt"
-    }));
+    assert_eq!(
+        record.external_session_id.as_deref(),
+        Some(first_external_id.as_str())
+    );
+    assert!(events
+        .events_for("acp-session-1")
+        .await
+        .iter()
+        .any(|event| {
+            event.event.event_type == "assistant.delta"
+                && event.event.payload["text"] == "ACP says: second prompt"
+        }));
 
     supervisor
         .start(request("acp-session-cancel", "cancel-me"))
@@ -78,13 +88,14 @@ async fn acp_subprocess_streams_output_continues_and_cancels() {
         .await
         .expect("cancel ACP prompt");
     assert_eq!(cancelled.status, RuntimeStatus::Cancelled);
-    assert!(
-        events
-            .events_for("acp-session-cancel")
-            .await
-            .iter()
-            .any(|event| event.event.event_type == "turn.cancelled")
-    );
+    assert!(events
+        .events_for("acp-session-cancel")
+        .await
+        .iter()
+        .any(|event| event.event.event_type == "turn.cancelled"));
 
-    supervisor.shutdown().await.expect("shutdown ACP subprocesses");
+    supervisor
+        .shutdown()
+        .await
+        .expect("shutdown ACP subprocesses");
 }
