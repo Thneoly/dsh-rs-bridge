@@ -52,6 +52,8 @@ test('DSH AgentFactory maps real Rust bridge turns into the DSH Session log', as
       factory = new BridgeAgentFactory(pluginCtx, bridge, {
         ...processConfig,
         runtimeId: 'mock',
+        permissionPolicy: 'deny',
+        turnTimeoutMs: 30000,
       })
     },
   })
@@ -116,6 +118,183 @@ test('DSH AgentFactory maps real Rust bridge turns into the DSH Session log', as
 })
 
 
+test('session.wait uses the turn budget, not the generic request timeout', async () => {
+  const command = process.env.DSH_RS_BRIDGE_BIN
+  assert.ok(command, 'DSH_RS_BRIDGE_BIN must point to the built Rust bridge binary')
+
+  // Each mock turn sleeps twice before settling: ~2.4 s in total, longer than
+  // the 1 s generic request timeout but well inside the 30 s turn budget. A
+  // regression that routes session.wait through requestTimeoutMs fails here.
+  const stateDir = mkdtempSync(join(tmpdir(), 'dsh-rs-bridge-turn-budget-'))
+  const ctx = new Context()
+  await ctx.plugin(SessionProjectionRegistry)
+  await ctx.plugin(AgentRegistry)
+  await ctx.plugin(SessionStore)
+
+  let unregisterTurnBoundary
+  let unregisterInbox
+  let bridge
+  let factory
+  const processConfig = {
+    command,
+    args: ['--stdio'],
+    cwd: resolve(process.cwd(), '..'),
+    env: {
+      DSH_RS_BRIDGE_MOCK_DELAY_MS: '1200',
+      DSH_RS_BRIDGE_STATE_DIR: stateDir,
+    },
+    requestTimeoutMs: 1000,
+    shutdownTimeoutMs: 3000,
+  }
+  const pluginFiber = ctx.plugin({
+    name: 'dsh-runtime-bridge-turn-budget-test',
+    inject: ['agents', 'sessions', 'sessionProjections'],
+    apply(pluginCtx) {
+      unregisterTurnBoundary = pluginCtx.sessionProjections.register(turnBoundaryProjectionDefinition)
+      unregisterInbox = pluginCtx.sessionProjections.register(inboxProjectionDefinition)
+      bridge = new JsonlBridgeClient(pluginCtx, processConfig)
+      factory = new BridgeAgentFactory(pluginCtx, bridge, {
+        ...processConfig,
+        runtimeId: 'mock',
+        permissionPolicy: 'deny',
+        turnTimeoutMs: 30000,
+      })
+    },
+  })
+  await pluginFiber
+  let handle
+
+  try {
+    handle = await factory.createAgent(ctx, {
+      sessionId: SessionId('dsh-mock-turn-budget'),
+      agentOptions: { runtimeId: 'mock' },
+    })
+    handle.agent.followup(createUserMessage({
+      content: [{ type: 'text', text: 'slow prompt' }],
+      source: { kind: 'user' },
+    }))
+    await handle.agent.whenIdle()
+
+    const events = handle.agent.session.snapshotEvents()
+    const assistantMessages = events.filter(event => event.type === 'assistant/message')
+    assert.equal(assistantMessages.length, 1)
+    assert.equal(assistantMessages[0].data.message.content[0].text, 'mock runtime completed the task')
+    assert.ok(events.some(event => event.type === 'turn/end' && event.data.reason.kind === 'completed'))
+  } finally {
+    if (handle !== undefined) await handle.dispose()
+    await factory.disposeAll()
+    await bridge.shutdown()
+    rmSync(stateDir, { recursive: true, force: true })
+    unregisterInbox()
+    unregisterTurnBoundary()
+    await pluginFiber.dispose()
+    await ctx.fiber.dispose()
+  }
+})
+
+
+test('DSH AgentFactory answers forwarded permission requests per policy', async () => {
+  const command = process.env.DSH_RS_BRIDGE_BIN
+  const acpAgent = process.env.DSH_RS_BRIDGE_ACP_TEST_BIN
+  assert.ok(command, 'DSH_RS_BRIDGE_BIN must point to the built Rust bridge binary')
+  assert.ok(acpAgent, 'DSH_RS_BRIDGE_ACP_TEST_BIN must point to the built ACP fixture agent')
+
+  const stateDir = mkdtempSync(join(tmpdir(), 'dsh-rs-bridge-state-permission-'))
+  const ctx = new Context()
+  await ctx.plugin(SessionProjectionRegistry)
+  await ctx.plugin(AgentRegistry)
+  await ctx.plugin(SessionStore)
+
+  let unregisterTurnBoundary
+  let unregisterInbox
+  let bridge
+  let factory
+  const processConfig = {
+    command,
+    args: ['--stdio'],
+    cwd: resolve(process.cwd(), '..'),
+    env: {
+      DSH_RS_BRIDGE_STATE_DIR: stateDir,
+      DSH_RS_BRIDGE_ACP_COMMAND: acpAgent,
+      DSH_RS_BRIDGE_ACP_ARGS: '[]',
+    },
+    requestTimeoutMs: 30000,
+    shutdownTimeoutMs: 3000,
+  }
+  const pluginFiber = ctx.plugin({
+    name: 'dsh-runtime-bridge-permission-integration-test',
+    inject: ['agents', 'sessions', 'sessionProjections'],
+    apply(pluginCtx) {
+      unregisterTurnBoundary = pluginCtx.sessionProjections.register(turnBoundaryProjectionDefinition)
+      unregisterInbox = pluginCtx.sessionProjections.register(inboxProjectionDefinition)
+      bridge = new JsonlBridgeClient(pluginCtx, processConfig)
+      factory = new BridgeAgentFactory(pluginCtx, bridge, {
+        ...processConfig,
+        runtimeId: 'acp',
+        permissionPolicy: 'deny',
+        turnTimeoutMs: 30000,
+      })
+    },
+  })
+  await pluginFiber
+  let handle
+  const runtimeEvents = []
+  ctx.on('agent/runtime-event', ({ agent, event }) => {
+    if (String(agent.id) === 'dsh-acp-permission-e2e') runtimeEvents.push(event)
+  })
+
+  try {
+    handle = await factory.createAgent(ctx, {
+      sessionId: SessionId('dsh-acp-permission-e2e'),
+      agentOptions: { runtimeId: 'acp' },
+    })
+    handle.agent.followup(createUserMessage({
+      content: [{ type: 'text', text: 'needs-permission' }],
+      source: { kind: 'user' },
+    }))
+    await handle.agent.whenIdle()
+
+    const events = handle.agent.session.snapshotEvents()
+    const assistantMessages = events.filter(event => event.type === 'assistant/message')
+    assert.equal(assistantMessages.length, 1)
+    assert.match(
+      assistantMessages[0].data.message.content[0].text,
+      /permission denied/,
+      'the deny policy must refuse the tool and surface the refusal',
+    )
+    // The runtime events are asynchronous notifications: poll briefly instead
+    // of asserting the instant whenIdle resolves.
+    const waitFor = async (predicate, ms = 2000) => {
+      const deadline = Date.now() + ms
+      while (Date.now() < deadline) {
+        if (predicate()) return true
+        await new Promise(resolve => setTimeout(resolve, 25))
+      }
+      return predicate()
+    }
+    assert.ok(
+      await waitFor(() => runtimeEvents.some(event => event.event_type === 'permission.requested')),
+      'the forwarded permission request must reach the host as a runtime event',
+    )
+    assert.ok(
+      await waitFor(() => runtimeEvents.some(event => event.event_type === 'permission.responded'
+        && event.payload?.source === 'host')),
+      'the automatic host decision must be reported back',
+    )
+    assert.ok(events.some(event => event.type === 'turn/end' && event.data.reason.kind === 'completed'))
+  } finally {
+    if (handle !== undefined) await handle.dispose()
+    await factory.disposeAll()
+    await bridge.shutdown()
+    rmSync(stateDir, { recursive: true, force: true })
+    unregisterInbox()
+    unregisterTurnBoundary()
+    await pluginFiber.dispose()
+    await ctx.fiber.dispose()
+  }
+})
+
+
 test('DSH AgentFactory restores persisted ACP conversation after bridge restart', async () => {
   const command = process.env.DSH_RS_BRIDGE_BIN
   const acpAgent = process.env.DSH_RS_BRIDGE_ACP_TEST_BIN
@@ -162,6 +341,8 @@ test('DSH AgentFactory restores persisted ACP conversation after bridge restart'
       factory = new BridgeAgentFactory(pluginCtx, bridge, {
         ...processConfig,
         runtimeId: 'acp',
+        permissionPolicy: 'deny',
+        turnTimeoutMs: 30000,
       })
     },
   })
@@ -205,6 +386,8 @@ test('DSH AgentFactory restores persisted ACP conversation after bridge restart'
     factory = new BridgeAgentFactory(testCtx, bridge, {
       ...processConfig,
       runtimeId: 'acp',
+      permissionPolicy: 'deny',
+      turnTimeoutMs: 30000,
     })
     resumedHandle = await factory.resume(ctx, {
       resumeSessionId: sessionId,

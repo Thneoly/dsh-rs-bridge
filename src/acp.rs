@@ -25,9 +25,9 @@ use tokio::{
 
 use crate::contracts::{
     RuntimeAdapter, RuntimeCapabilities, RuntimeContinueRequest, RuntimeError, RuntimeEvent,
-    RuntimeEventType, RuntimeHealth, RuntimeHealthStatus, RuntimeRestoreRequest,
-    RuntimeResumeRequest, RuntimeSendRequest, RuntimeSessionControl, RuntimeSessionHandle,
-    RuntimeStartRequest,
+    RuntimeEventType, RuntimeHealth, RuntimeHealthStatus, RuntimePermissionResponse,
+    RuntimeRestoreRequest, RuntimeResumeRequest, RuntimeSendRequest, RuntimeSessionControl,
+    RuntimeSessionHandle, RuntimeStartRequest,
 };
 
 const ACP_PROTOCOL_VERSION: u64 = 1;
@@ -35,6 +35,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 const PROMPT_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 const STDIN_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+const PERMISSION_TIMEOUT: Duration = Duration::from_secs(300);
 static NEXT_EXTERNAL_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Debug)]
@@ -46,6 +47,7 @@ pub struct AcpRuntimeConfig {
     pub env: HashMap<String, String>,
     pub prompt_timeout: Duration,
     pub stdin_write_timeout: Duration,
+    pub permission_timeout: Duration,
 }
 
 impl AcpRuntimeConfig {
@@ -58,6 +60,7 @@ impl AcpRuntimeConfig {
             env: HashMap::new(),
             prompt_timeout: PROMPT_TIMEOUT,
             stdin_write_timeout: STDIN_WRITE_TIMEOUT,
+            permission_timeout: PERMISSION_TIMEOUT,
         }
     }
 
@@ -97,6 +100,14 @@ impl AcpRuntimeConfig {
     /// including session/cancel) indefinitely.
     pub fn with_stdin_write_timeout(mut self, stdin_write_timeout: Duration) -> Self {
         self.stdin_write_timeout = stdin_write_timeout;
+        self
+    }
+
+    /// Override how long a forwarded permission request may wait for the
+    /// host's decision before the adapter auto-denies it. A permission must
+    /// never hold a turn hostage indefinitely.
+    pub fn with_permission_timeout(mut self, permission_timeout: Duration) -> Self {
+        self.permission_timeout = permission_timeout;
         self
     }
 }
@@ -239,6 +250,8 @@ impl RuntimeAdapter for AcpRuntime {
             live_input: false,
             // A completed turn can be followed by another prompt on the same ACP session.
             continuation: true,
+            // Permission requests are forwarded to the host as events.
+            permission_requests: true,
         }
     }
 
@@ -444,6 +457,31 @@ impl RuntimeAdapter for AcpRuntime {
                 ))
             })?;
         self.attach_prompt(session, request.prompt).await
+    }
+
+    async fn respond_permission(
+        &self,
+        request: RuntimePermissionResponse,
+    ) -> Result<(), RuntimeError> {
+        let session = self
+            .sessions
+            .lock()
+            .await
+            .get(&request.external_session_id)
+            .cloned()
+            .ok_or_else(|| {
+                RuntimeError::NotFound(format!(
+                    "in-process ACP session binding: {}",
+                    request.external_session_id
+                ))
+            })?;
+        session
+            .process
+            .answer_permission(
+                &request.permission_request_id,
+                PermissionDecision::Selected(request.option_id),
+            )
+            .await
     }
 
     async fn shutdown(&self) -> Result<(), RuntimeError> {
@@ -673,7 +711,12 @@ impl RuntimeSessionControl for AcpSessionControl {
                 "session/cancel",
                 json!({ "sessionId": self.acp_session_id }),
             )
-            .await
+            .await?;
+        // ACP requires answering outstanding permission requests with the
+        // cancelled outcome when the turn is cancelled, or the agent may wait
+        // for the permission response before honoring session/cancel.
+        self.process.cancel_pending_permissions().await;
+        Ok(())
     }
 
     async fn close(&self) -> Result<(), RuntimeError> {
@@ -688,6 +731,58 @@ impl RuntimeSessionControl for AcpSessionControl {
     }
 }
 
+/// What should be answered to the agent for an outstanding permission request.
+#[derive(Debug, Clone)]
+enum PermissionDecision {
+    /// The host selected one of the offered options.
+    Selected(String),
+    /// The host did not answer within the deadline: auto-deny.
+    TimedOut,
+    /// The turn was cancelled; ACP requires answering `cancelled`.
+    Cancelled,
+}
+
+struct PendingPermission {
+    acp_request_id: Value,
+    options: Vec<Value>,
+    /// First writer wins, under the mutex. This arbitrates the deadline race:
+    /// a host answer that lands in the expiry window either claims the slot
+    /// (and the deadline task must honor it) or loses it (and permission.respond
+    /// reports that the request already settled).
+    decision: Mutex<Option<PermissionDecision>>,
+    notified: Arc<tokio::sync::Notify>,
+}
+
+impl PendingPermission {
+    fn new(acp_request_id: Value, options: Vec<Value>) -> Arc<Self> {
+        Arc::new(Self {
+            acp_request_id,
+            options,
+            decision: Mutex::new(None),
+            notified: Arc::new(tokio::sync::Notify::new()),
+        })
+    }
+
+    /// Claim the decision. Returns false when somebody already decided.
+    async fn decide(&self, decision: PermissionDecision) -> bool {
+        let mut slot = self.decision.lock().await;
+        if slot.is_some() {
+            return false;
+        }
+        *slot = Some(decision);
+        true
+    }
+
+    /// The winning decision; only call after the slot is claimed.
+    async fn decision(&self) -> PermissionDecision {
+        self.decision
+            .lock()
+            .await
+            .clone()
+            .expect("permission decision must be claimed before reading")
+    }
+}
+
 struct AcpProcess {
     child: Mutex<Child>,
     stdin: Mutex<Option<ChildStdin>>,
@@ -697,6 +792,8 @@ struct AcpProcess {
     stopped: AtomicBool,
     prompt_timeout: Duration,
     stdin_write_timeout: Duration,
+    permission_timeout: Duration,
+    permissions: Mutex<HashMap<String, Arc<PendingPermission>>>,
 }
 
 impl AcpProcess {
@@ -734,6 +831,8 @@ impl AcpProcess {
             stopped: AtomicBool::new(false),
             prompt_timeout: config.prompt_timeout,
             stdin_write_timeout: config.stdin_write_timeout,
+            permission_timeout: config.permission_timeout,
+            permissions: Mutex::new(HashMap::new()),
         });
         let weak = Arc::downgrade(&process);
         tokio::spawn(async move {
@@ -908,25 +1007,25 @@ impl AcpProcess {
         }
     }
 
-    async fn handle_message(&self, message: Value) -> Result<(), RuntimeError> {
+    async fn handle_message(self: &Arc<Self>, message: Value) -> Result<(), RuntimeError> {
         if let Some(method) = message.get("method").and_then(Value::as_str) {
             if let Some(id) = message.get("id").cloned() {
-                let response = if method == "session/request_permission" {
-                    json!({
-                        "jsonrpc": "2.0",
-                        "id": id,
-                        "result": { "outcome": "cancelled" }
-                    })
-                } else {
-                    json!({
-                        "jsonrpc": "2.0",
-                        "id": id,
-                        "error": {
-                            "code": -32601,
-                            "message": format!("unsupported ACP client request: {method}")
-                        }
-                    })
-                };
+                if method == "session/request_permission" {
+                    return self
+                        .handle_permission_request(
+                            id,
+                            message.get("params").unwrap_or(&Value::Null),
+                        )
+                        .await;
+                }
+                let response = json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": {
+                        "code": -32601,
+                        "message": format!("unsupported ACP client request: {method}")
+                    }
+                });
                 return self.write_message(response).await;
             }
             if method == "session/update" {
@@ -1028,6 +1127,191 @@ impl AcpProcess {
         Ok(())
     }
 
+    /// Forward an agent `session/request_permission` to the host as a
+    /// `permission.requested` event and hold the ACP response until the host
+    /// answers, the deadline passes, or the turn is cancelled.
+    async fn handle_permission_request(
+        self: &Arc<Self>,
+        id: Value,
+        params: &Value,
+    ) -> Result<(), RuntimeError> {
+        let request_id = id.to_string();
+        let options = params
+            .get("options")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let Some(route) = self.route.lock().await.clone() else {
+            // No attached turn can receive the decision: answer with the
+            // spec's cancelled outcome instead of leaving the agent hanging.
+            return self
+                .write_message(json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": { "outcome": { "outcome": "cancelled" } }
+                }))
+                .await;
+        };
+
+        let permission = PendingPermission::new(id, options);
+        self.permissions
+            .lock()
+            .await
+            .insert(request_id.clone(), permission.clone());
+
+        let weak = Arc::downgrade(self);
+        let deadline = self.permission_timeout;
+        let task_route = route.clone();
+        let task_request_id = request_id.clone();
+        let task_permission = permission.clone();
+        tokio::spawn(async move {
+            // Wake on a host/cancel decision, or claim the slot at the
+            // deadline. The CLAIMED slot decides in either case: a host answer
+            // that raced the timer is honored, never silently replaced.
+            let notify = task_permission.notified.clone();
+            let notified = notify.notified();
+            tokio::pin!(notified);
+            if tokio::time::timeout(deadline, &mut notified).await.is_err()
+                && !task_permission.decide(PermissionDecision::TimedOut).await
+            {
+                // The host claimed the slot inside the expiry window.
+            }
+            let decision = task_permission.decision().await;
+            let Some(process) = weak.upgrade() else {
+                return;
+            };
+            process.permissions.lock().await.remove(&task_request_id);
+            process
+                .finish_permission(task_permission, decision, &task_route)
+                .await;
+        });
+
+        if route
+            .emit(
+                RuntimeEventType::PermissionRequested,
+                json!({
+                    "request_id": request_id.clone(),
+                    "session_id": params.get("sessionId").cloned().unwrap_or(Value::Null),
+                    "tool_call": params.get("toolCall").cloned().unwrap_or(Value::Null),
+                    "options": permission.options.clone(),
+                }),
+            )
+            .await
+            .is_err()
+        {
+            // The host detached from the event stream: settle immediately.
+            let _ = self
+                .answer_permission(&request_id, PermissionDecision::Cancelled)
+                .await;
+        }
+        Ok(())
+    }
+
+    /// Deliver a host decision (or synthesized timeout/cancel outcome) to the
+    /// agent and report it as a `permission.responded` event.
+    async fn finish_permission(
+        &self,
+        permission: Arc<PendingPermission>,
+        decision: PermissionDecision,
+        route: &Arc<TurnRoute>,
+    ) {
+        let request_id = permission.acp_request_id.to_string();
+        let (outcome, option_id, source) = match &decision {
+            PermissionDecision::Selected(option_id) => (
+                json!({ "outcome": "selected", "optionId": option_id }),
+                Some(option_id.clone()),
+                "host",
+            ),
+            PermissionDecision::Cancelled => (json!({ "outcome": "cancelled" }), None, "cancelled"),
+            PermissionDecision::TimedOut => {
+                // Auto-deny with the first reject-kind option; fall back to
+                // cancelled when the agent offered no reject option.
+                match permission.options.iter().find(|option| {
+                    matches!(
+                        option.get("kind").and_then(Value::as_str),
+                        Some("reject_once") | Some("reject_always")
+                    )
+                }) {
+                    Some(option) => {
+                        let option_id = option
+                            .get("optionId")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_owned();
+                        (
+                            json!({ "outcome": "selected", "optionId": option_id }),
+                            Some(option_id),
+                            "timeout",
+                        )
+                    }
+                    None => (json!({ "outcome": "cancelled" }), None, "timeout"),
+                }
+            }
+        };
+        if self
+            .write_message(json!({
+                "jsonrpc": "2.0",
+                "id": permission.acp_request_id.clone(),
+                "result": { "outcome": outcome }
+            }))
+            .await
+            .is_ok()
+        {
+            let mut payload = json!({ "request_id": request_id, "source": source });
+            if let Some(option_id) = option_id {
+                payload["option_id"] = json!(option_id);
+            }
+            // Best-effort observability: after the turn ends nobody consumes it.
+            let _ = route
+                .emit(RuntimeEventType::PermissionResponded, payload)
+                .await;
+        }
+    }
+
+    /// Route a host decision to the task holding the outstanding request.
+    /// Fails loudly when the deadline already settled the request, so the RPC
+    /// never reports a delivery that did not happen.
+    async fn answer_permission(
+        &self,
+        request_id: &str,
+        decision: PermissionDecision,
+    ) -> Result<(), RuntimeError> {
+        let permission = self
+            .permissions
+            .lock()
+            .await
+            .remove(request_id)
+            .ok_or_else(|| {
+                RuntimeError::NotFound(format!(
+                    "unknown or already-answered permission request: {request_id}"
+                ))
+            })?;
+        if !permission.decide(decision).await {
+            return Err(RuntimeError::Transport(format!(
+                "permission request already settled by its deadline: {request_id}"
+            )));
+        }
+        permission.notified.notify_one();
+        Ok(())
+    }
+
+    /// Resolve every outstanding permission request as cancelled. The ACP
+    /// spec requires the client to answer cancelled when a turn is cancelled.
+    async fn cancel_pending_permissions(&self) {
+        let drained: Vec<Arc<PendingPermission>> = self
+            .permissions
+            .lock()
+            .await
+            .drain()
+            .map(|(_, permission)| permission)
+            .collect();
+        for permission in drained {
+            if permission.decide(PermissionDecision::Cancelled).await {
+                permission.notified.notify_one();
+            }
+        }
+    }
+
     async fn fail_pending(&self, error: RuntimeError) {
         let mut pending = self.pending.lock().await;
         for (_, sender) in pending.drain() {
@@ -1048,6 +1332,10 @@ impl AcpProcess {
         if self.stopped.swap(true, Ordering::SeqCst) {
             return;
         }
+        // Settle outstanding permissions as cancelled so their tasks wake,
+        // fail their write to the dying process, and exit instead of parking
+        // until their deadline.
+        self.cancel_pending_permissions().await;
         self.stdin.lock().await.take();
         let mut child = self.child.lock().await;
         let _ = child.start_kill();

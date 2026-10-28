@@ -14,9 +14,9 @@ use tokio_util::sync::CancellationToken;
 use crate::contracts::{
     ExecutionEventEnvelope, ResumeExecutionRequest, RuntimeAdapter, RuntimeCapabilities,
     RuntimeContinueRequest, RuntimeDescriptor, RuntimeError, RuntimeEvent, RuntimeExecutionSummary,
-    RuntimeHealthStatus, RuntimeRestoreRequest, RuntimeResumeRequest, RuntimeSessionControl,
-    RuntimeSessionHandle, RuntimeSessionRecord, RuntimeStartRequest, RuntimeStatus,
-    StartExecutionRequest,
+    RuntimeHealthStatus, RuntimePermissionResponse, RuntimeRestoreRequest, RuntimeResumeRequest,
+    RuntimeSessionControl, RuntimeSessionHandle, RuntimeSessionRecord, RuntimeStartRequest,
+    RuntimeStatus, StartExecutionRequest,
 };
 use crate::store::{ExecutionEventSink, SessionStore};
 
@@ -725,6 +725,43 @@ impl RuntimeSupervisor {
             external_session_id: Some(external_id),
             status: RuntimeStatus::Running,
         })
+    }
+
+    /// Deliver a host decision for a forwarded `permission.requested` event.
+    /// The decision belongs to the conversation, not to an active execution,
+    /// so it routes through the persisted binding like session.restore does.
+    pub async fn respond_permission(
+        &self,
+        dsh_session_id: &str,
+        permission_request_id: &str,
+        option_id: &str,
+    ) -> Result<(), RuntimeError> {
+        let record = self
+            .inner
+            .sessions
+            .get(dsh_session_id)
+            .await?
+            .ok_or_else(|| RuntimeError::NotFound(format!("DSH session: {dsh_session_id}")))?;
+        let external_session_id = record.external_session_id.clone().ok_or_else(|| {
+            RuntimeError::Lifecycle(format!(
+                "external session reference missing: {dsh_session_id}"
+            ))
+        })?;
+        let adapter = self.require_adapter(&record.runtime_id)?;
+        if !adapter.capabilities().permission_requests {
+            return Err(RuntimeError::Capability(format!(
+                "runtime {} does not forward permission requests",
+                adapter.id()
+            )));
+        }
+        adapter
+            .respond_permission(RuntimePermissionResponse {
+                dsh_session_id: dsh_session_id.to_owned(),
+                external_session_id,
+                permission_request_id: permission_request_id.to_owned(),
+                option_id: option_id.to_owned(),
+            })
+            .await
     }
 
     pub async fn interrupt(

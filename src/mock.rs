@@ -69,6 +69,7 @@ impl MockRuntime {
             interrupt: true,
             live_input: false,
             continuation: self.continuation,
+            permission_requests: false,
         }
     }
 

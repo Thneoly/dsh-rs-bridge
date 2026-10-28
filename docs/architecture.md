@@ -66,6 +66,17 @@ in-place resume RPC stays disabled by design; restart recovery goes through
 `session.restore`, which reattaches the persisted binding instead of claiming
 to resume an interrupted in-flight turn.
 
+Permission interaction: the adapter advertises `permission_requests` and
+forwards each agent `session/request_permission` to the host as a
+`permission.requested` event, holding the ACP response until the host answers
+through the `permission.respond` RPC. Every delivered decision — host,
+deadline auto-deny, or turn-cancellation — is reported as
+`permission.responded`. The TypeScript side answers automatically per its
+`permissionPolicy` configuration (deny by default) because DSH exposes no
+interactive host channel to the Agent yet; the question and the answer are
+also surfaced as transient `agent/runtime-event` notifications so a future
+permission UI can take over.
+
 Exception recovery: agent-process death mid-turn settles the turn as failed
 and marks the process dead, so `session.restore` transparently replaces the
 zombie with a fresh agent bound to the same external conversation. Prompt
