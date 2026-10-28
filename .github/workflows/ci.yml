@@ -38,8 +38,10 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - name: Check real ACP smoke script syntax
-        run: node --check scripts/acp-smoke.mjs
+      - name: Check ACP smoke script syntax
+        run: |
+          node --check scripts/acp-smoke.mjs
+          node --check scripts/bridge-acp-e2e.mjs
       - name: Install TypeScript integration dependencies
         working-directory: typescript
         run: npm install --no-audit --no-fund --legacy-peer-deps --package-lock=false
