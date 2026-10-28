@@ -29,8 +29,8 @@ impl JsonlWriter {
 
     async fn write_value(&self, value: &Value) -> Result<(), RuntimeError> {
         let mut stdout = self.stdout.lock().await;
-        let mut line = serde_json::to_vec(value)
-            .map_err(|error| RuntimeError::Protocol(error.to_string()))?;
+        let mut line =
+            serde_json::to_vec(value).map_err(|error| RuntimeError::Protocol(error.to_string()))?;
         line.push(b'\n');
         stdout
             .write_all(&line)
@@ -150,8 +150,7 @@ async fn dispatch(
                     cancellation: CancellationToken::new(),
                 })
                 .await?;
-            serde_json::to_value(summary)
-                .map_err(|error| RuntimeError::Protocol(error.to_string()))
+            serde_json::to_value(summary).map_err(|error| RuntimeError::Protocol(error.to_string()))
         }
         "session.resume" => {
             let params: SessionParams = parse_params(&request.params)?;
@@ -161,8 +160,7 @@ async fn dispatch(
                     cancellation: CancellationToken::new(),
                 })
                 .await?;
-            serde_json::to_value(summary)
-                .map_err(|error| RuntimeError::Protocol(error.to_string()))
+            serde_json::to_value(summary).map_err(|error| RuntimeError::Protocol(error.to_string()))
         }
         "session.cancel" => {
             let params: CancelParams = parse_params(&request.params)?;
@@ -172,22 +170,16 @@ async fn dispatch(
                     params.reason.as_deref().unwrap_or("cancelled by DSH host"),
                 )
                 .await?;
-            serde_json::to_value(summary)
-                .map_err(|error| RuntimeError::Protocol(error.to_string()))
+            serde_json::to_value(summary).map_err(|error| RuntimeError::Protocol(error.to_string()))
         }
         "session.wait" => {
             let params: SessionParams = parse_params(&request.params)?;
-            let summary = supervisor
-                .wait_for_terminal(&params.dsh_session_id)
-                .await?;
-            serde_json::to_value(summary)
-                .map_err(|error| RuntimeError::Protocol(error.to_string()))
+            let summary = supervisor.wait_for_terminal(&params.dsh_session_id).await?;
+            serde_json::to_value(summary).map_err(|error| RuntimeError::Protocol(error.to_string()))
         }
         "session.send" => {
             let params: SendParams = parse_params(&request.params)?;
-            supervisor
-                .send(&params.dsh_session_id, params.text)
-                .await?;
+            supervisor.send(&params.dsh_session_id, params.text).await?;
             Ok(json!({ "accepted": true }))
         }
         "bridge.shutdown" => Ok(json!({ "stopping": true })),
@@ -248,7 +240,9 @@ async fn run_stdio() -> Result<(), RuntimeError> {
                 write_response(
                     &writer,
                     &Value::Null,
-                    Err(RuntimeError::Protocol(format!("invalid JSONL request: {error}"))),
+                    Err(RuntimeError::Protocol(format!(
+                        "invalid JSONL request: {error}"
+                    ))),
                 )
                 .await?;
                 continue;
