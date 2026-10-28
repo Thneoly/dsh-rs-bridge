@@ -59,9 +59,10 @@ cargo run -- --stdio
 Optional `DSH_RS_BRIDGE_ACP_ENV` is a JSON object of environment overrides.
 When enabled, the adapter appears as runtime ID `acp`; use that ID in
 `session.start`. ACP session IDs are kept separate from DSH session IDs.
-Continuation uses the same in-process ACP session. Resume after bridge restart
-is intentionally not advertised yet because external session bindings are not
-durable. The bridge terminates ACP subprocesses during orderly shutdown.
+Continuation uses the same in-process ACP session while the bridge lives;
+after a bridge restart, `session.restore` reattaches the persisted binding to
+a fresh agent process. The bridge terminates ACP subprocesses during orderly
+shutdown.
 
 
 ## Real ACP smoke test
@@ -107,32 +108,76 @@ The TypeScript AgentFactory now supports `resume({ resumeSessionId })` using
 the DSH JSONL persistence backend. The Rust binding journal and DSH session log
 must both be retained for full cross-process restoration.
 
-## Real ACP agent end-to-end check (opt-in)
+## Real-model full-conversation gate (opt-in)
 
 The ordinary CI smoke launches a real OpenCode ACP binary and verifies
 `initialize` + `session/new` **without requiring credentials**. This proves
 the agent handshake, not model generation.
 
-To verify the full Rust bridge → real ACP agent → model → event stream loop,
-first configure authentication with the agent's documented login/API-key
-procedure. Use a disposable workspace and a low-cost model. Then run:
+`scripts/bridge-acp-e2e.mjs` is the full-conversation acceptance gate: one
+DSH session, one continuous real-model conversation, driven through
+
+- **A** a first turn: streamed `assistant.delta` strictly before
+  `turn.completed`, terminal status `completed`, with a random codeword
+  planted in the prompt;
+- **B** a same-session recall turn that must echo the codeword (verifies real
+  conversational memory, not just session identity);
+- **C** a mid-stream cancellation: cancel after the first streamed delta and
+  require `turn.cancelled`;
+- **D** a durable-journal assertion: `sessions.jsonl` replay must match the
+  observed terminal states;
+- **E** a bridge **restart** followed by `session.restore` and another
+  codeword recall on the same external session (verifies the conversation
+  survives the restart, not just the binding).
+
+The gate is strict about protocol framing: any non-JSON stdout line or
+envelope violation from the bridge fails the run. On failure it keeps a
+`gate-report.json` (full event log including model output) and per-bridge
+stderr logs in a temp directory and prints the path. Console output stays
+clean of prompts, model output, credentials, and external IDs.
+
+### Running the gate
+
+The gate is agent-agnostic: it drives whatever `DSH_RS_BRIDGE_ACP_COMMAND`
+points at. With OpenCode (2.2.0, the same version CI pins) against an
+Anthropic-compatible endpoint:
 
 ```bash
 cargo build --bin dsh-rs-bridge
 export DSH_RS_BRIDGE_BIN="$PWD/target/debug/dsh-rs-bridge"
-export DSH_RS_BRIDGE_ACP_COMMAND="$(command -v opencode)"
+export DSH_RS_BRIDGE_ACP_COMMAND="/path/to/opencode"
 export DSH_RS_BRIDGE_ACP_ARGS='["acp"]'
+export OPENCODE_CONFIG="/path/to/opencode-gate.json"
 node scripts/bridge-acp-e2e.mjs
 ```
 
-On Windows PowerShell set `DSH_RS_BRIDGE_BIN` to the built `.exe`,
-`DSH_RS_BRIDGE_ACP_COMMAND` to the agent executable, and
-`DSH_RS_BRIDGE_ACP_ARGS` to a JSON array as above.
+`opencode-gate.json` selects a real model and, when the provider sits behind
+an Anthropic-compatible gateway, points the provider at it. Note the SDK
+appends `/messages?beta=true` itself, so `baseURL` must include the `/v1`
+suffix:
 
-The opt-in script checks successful execution of two distinct prompts,
-streaming `assistant.delta`, terminal events, and preservation of the
-external session identity across turns. It does not log prompt text,
-generated content, session IDs, or API keys. It fails when auth, protocol,
-model selection, or execution is incompatible; this credentialed check is
-**not run by ordinary CI**. The bridge currently declines ACP permission
-requests, so use non-mutating prompts for this validation.
+```json
+{
+  "model": "anthropic/claude-sonnet-5",
+  "provider": {
+    "anthropic": {
+      "options": {
+        "baseURL": "{env:ANTHROPIC_BASE_URL}/v1",
+        "apiKey": "{env:ANTHROPIC_API_KEY}"
+      }
+    }
+  }
+}
+```
+
+Tuning knobs: `DSH_RS_BRIDGE_GATE_RPC_TIMEOUT_MS` (short RPC budget, default
+20 s), `DSH_RS_BRIDGE_GATE_TURN_TIMEOUT_MS` (per-turn budget, default 300 s),
+`DSH_RS_BRIDGE_GATE_CANCEL_PROBE_TIMEOUT_MS` (how long to wait for the first
+delta before cancelling, default 30 s), `DSH_RS_BRIDGE_GATE_CANCEL_ATTEMPTS`
+(default 3, for models that finish before a delta can be cancelled),
+`DSH_RS_BRIDGE_GATE_KEEP=1` and `DSH_RS_BRIDGE_GATE_REPORT=<path>` to keep or
+copy the report on success.
+
+The gate spends real model tokens; it is **not run by ordinary CI**. The
+bridge currently declines ACP permission requests, so turns whose tools
+require permission are denied — the gate prompts avoid mutating tool use.
