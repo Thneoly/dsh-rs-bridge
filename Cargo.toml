@@ -10,5 +10,10 @@ async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "io-util", "io-std"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "io-util", "io-std", "process"] }
 tokio-util = { version = "0.7", features = ["rt"] }
+
+[[bin]]
+name = "acp-test-agent"
+path = "tests/fixtures/acp-test-agent.rs"
+test = false

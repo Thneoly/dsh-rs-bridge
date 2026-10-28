@@ -145,6 +145,26 @@ impl RuntimeSupervisor {
                 }
             }
         }
+
+        let adapters: Vec<Arc<dyn RuntimeAdapter>> = self
+            .inner
+            .adapters
+            .read()
+            .map_err(|_| RuntimeError::Lifecycle("runtime registry lock poisoned".to_owned()))?
+            .values()
+            .cloned()
+            .collect();
+        let mut shutdown_error = None;
+        for adapter in adapters {
+            if let Err(error) = adapter.shutdown().await {
+                if shutdown_error.is_none() {
+                    shutdown_error = Some(error);
+                }
+            }
+        }
+        if let Some(error) = shutdown_error {
+            return Err(error);
+        }
         Ok(())
     }
 

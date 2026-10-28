@@ -1,9 +1,9 @@
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use dsh_rs_bridge::{
-    ExecutionEventEnvelope, ExecutionEventSink, MemorySessionStore, MockRuntime,
-    PersistedExecutionEvent, ResumeExecutionRequest, RuntimeError, RuntimeSupervisor,
-    StartExecutionRequest,
+    AcpRuntime, AcpRuntimeConfig, ExecutionEventEnvelope, ExecutionEventSink,
+    MemorySessionStore, MockRuntime, PersistedExecutionEvent, ResumeExecutionRequest,
+    RuntimeError, RuntimeSupervisor, StartExecutionRequest,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -235,6 +235,33 @@ async fn run_stdio() -> Result<(), RuntimeError> {
             .with_continuation(true)
             .with_delay(Duration::from_millis(delay_ms)),
     ))?;
+
+    // ACP is opt-in so the bridge remains runnable without an installed agent.
+    if let Ok(command) = std::env::var("DSH_RS_BRIDGE_ACP_COMMAND") {
+        if !command.trim().is_empty() {
+            let mut config = AcpRuntimeConfig::new(command);
+            if let Ok(args) = std::env::var("DSH_RS_BRIDGE_ACP_ARGS") {
+                config.args = serde_json::from_str::<Vec<String>>(&args).map_err(|error| {
+                    RuntimeError::Configuration(format!(
+                        "DSH_RS_BRIDGE_ACP_ARGS must be a JSON string array: {error}"
+                    ))
+                })?;
+            }
+            if let Ok(cwd) = std::env::var("DSH_RS_BRIDGE_ACP_CWD") {
+                if !cwd.trim().is_empty() {
+                    config.cwd = Some(cwd.into());
+                }
+            }
+            if let Ok(env) = std::env::var("DSH_RS_BRIDGE_ACP_ENV") {
+                config.env = serde_json::from_str::<HashMap<String, String>>(&env).map_err(
+                    |error| RuntimeError::Configuration(format!(
+                        "DSH_RS_BRIDGE_ACP_ENV must be a JSON string map: {error}"
+                    )),
+                )?;
+            }
+            supervisor.register(Arc::new(AcpRuntime::new(config)))?;
+        }
+    }
 
     let stdin = tokio::io::stdin();
     let mut lines = BufReader::new(stdin).lines();

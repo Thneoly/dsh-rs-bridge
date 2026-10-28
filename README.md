@@ -10,9 +10,9 @@ This is not a rewrite of DSH and does not confuse a model API provider with a fu
 
 ## Current status
 
-Implemented: Rust runtime contract and supervisor, versioned stdio JSONL server, real-process integration test, multi-turn continuation semantics, and a TypeScript DSH AgentFactory/Session adapter with CI type-checking.
+Implemented: Rust runtime contract and supervisor, versioned stdio JSONL server, real-process integration test, multi-turn continuation semantics, a TypeScript DSH AgentFactory/Session adapter, and an opt-in ACP v1 subprocess adapter with event translation and cancellation.
 
-Not implemented yet: ACP/Claude CLI/CodeAgent adapters, durable external-session binding storage, live assistant-stream frames, external tool-event projection, and reliable DSH persisted-session resume.
+Not implemented yet: durable external-session binding storage, restart-safe ACP resume, live assistant-stream frames in the TypeScript adapter, richer external tool-event projection, and vendor-specific CLI adapters.
 
 ## Requirements
 
@@ -41,3 +41,24 @@ The server emits JSONL only on stdout. Keep logs and diagnostics on stderr.
 The DSH plugin lives in `typescript/`; see [its integration guide](typescript/README.md). The plugin must be loaded instead of `@deepseek-ai/dsh-agent-loop`, because DSH exposes one AgentFactory slot.
 
 See docs/architecture.md, docs/protocol.md, and docs/dsh-baseline.md.
+
+
+## ACP runtime (opt-in)
+
+The bridge registers the ACP v1 adapter when `DSH_RS_BRIDGE_ACP_COMMAND` is set.
+The command is launched as a subprocess and speaks ACP JSON-RPC over stdin/stdout.
+Configure arguments as a JSON array so spaces are preserved:
+
+```powershell
+$env:DSH_RS_BRIDGE_ACP_COMMAND = "your-acp-agent"
+$env:DSH_RS_BRIDGE_ACP_ARGS = '["--your-option","value with spaces"]'
+$env:DSH_RS_BRIDGE_ACP_CWD = "C:\\work\\project"
+cargo run -- --stdio
+```
+
+Optional `DSH_RS_BRIDGE_ACP_ENV` is a JSON object of environment overrides.
+When enabled, the adapter appears as runtime ID `acp`; use that ID in
+`session.start`. ACP session IDs are kept separate from DSH session IDs.
+Continuation uses the same in-process ACP session. Resume after bridge restart
+is intentionally not advertised yet because external session bindings are not
+durable. The bridge terminates ACP subprocesses during orderly shutdown.
