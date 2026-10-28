@@ -30,7 +30,10 @@ test('DSH AgentFactory maps real Rust bridge turns into the DSH Session log', as
     command,
     args: ['--stdio'],
     cwd: resolve(process.cwd(), '..'),
-    env: { DSH_RS_BRIDGE_MOCK_DELAY_MS: '5' },
+    env: {
+      DSH_RS_BRIDGE_MOCK_DELAY_MS: '5',
+      DSH_RS_BRIDGE_MOCK_TOOL_EVENTS: '1',
+    },
     requestTimeoutMs: 30000,
     shutdownTimeoutMs: 3000,
   }
@@ -49,6 +52,14 @@ test('DSH AgentFactory maps real Rust bridge turns into the DSH Session log', as
   })
   await pluginFiber
   let handle
+  const assistantFrames = []
+  const runtimeToolEvents = []
+  ctx.on('agent/assistant-stream', ({ agent, frame }) => {
+    if (String(agent.id) === 'dsh-runtime-integration') assistantFrames.push(frame)
+  })
+  ctx.on('agent/runtime-event', ({ agent, event }) => {
+    if (String(agent.id) === 'dsh-runtime-integration') runtimeToolEvents.push(event)
+  })
 
   try {
     handle = await factory.createAgent(ctx, {
@@ -66,6 +77,13 @@ test('DSH AgentFactory maps real Rust bridge turns into the DSH Session log', as
     let assistantMessages = events.filter(event => event.type === 'assistant/message')
     assert.equal(assistantMessages.length, 1)
     assert.equal(assistantMessages[0].data.message.content[0].text, 'mock runtime completed the task')
+    assert.ok(assistantMessages[0].data.stream.some(record => record.type === 'text-chunks'))
+    assert.ok(assistantMessages[0].data.stream.some(record => record.type === 'chunk' && record.chunk.type === 'finish'))
+    assert.ok(assistantFrames.some(frame => frame.type === 'start'))
+    assert.ok(assistantFrames.some(frame => frame.type === 'chunk' && frame.chunk.type === 'text-delta' && frame.chunk.text === 'mock runtime completed the task'))
+    assert.ok(assistantFrames.some(frame => frame.type === 'end' && frame.outcome.kind === 'committed'))
+    assert.ok(runtimeToolEvents.some(event => event.event_type === 'tool.started'))
+    assert.ok(runtimeToolEvents.some(event => event.event_type === 'tool.completed'))
     assert.ok(events.some(event => event.type === 'turn/end' && event.data.reason.kind === 'completed'))
 
     handle.agent.followup(createUserMessage({

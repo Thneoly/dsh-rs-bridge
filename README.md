@@ -12,7 +12,7 @@ This is not a rewrite of DSH and does not confuse a model API provider with a fu
 
 Implemented: Rust runtime contract and supervisor, versioned stdio JSONL server, real-process integration test, multi-turn continuation semantics, a TypeScript DSH AgentFactory/Session adapter, and an opt-in ACP v1 subprocess adapter with event translation and cancellation.
 
-Not implemented yet: durable external-session binding storage, restart-safe ACP resume, live assistant-stream frames in the TypeScript adapter, richer external tool-event projection, and vendor-specific CLI adapters.
+Not implemented yet: durable external-session binding storage, restart-safe ACP resume, durable tool-event normalization, and vendor-specific CLI adapters.
 
 ## Requirements
 
