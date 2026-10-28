@@ -32,9 +32,10 @@ Per-agent engine selection is available through the merge-extensible DSH `AgentO
 
 - DSH creates and owns the Agent and Session; the Rust process owns the external runtime session and execution lifecycle.
 - Each external execution maps to one DSH turn and one step. User input, assistant output, step/turn boundaries, inbox splices, and terminal status are written to the DSH Session.
-- Assistant deltas are accumulated and committed as one final DSH assistant message. Live assistant-stream frames and external tool-call/result projection are not implemented yet.
+- Assistant deltas are published as transient `agent/assistant-stream` start/chunk/end frames and compacted into the final durable `assistant/message` or `assistant/attempt` event.
+- External `tool.*` events are surfaced as transient `agent/runtime-event` notifications. They are deliberately not rewritten as DSH `tool/call` / `tool/result` events because an external agent's internal tool cycle is not necessarily a DSH model tool-call cycle.
 - `AgentFactory.resume()` is intentionally rejected for now: the Rust bridge stores DSH-to-external session bindings in memory. Durable binding storage must be implemented before DSH persisted-session resume can be reliable.
-- The Rust bridge currently registers only the deterministic `mock` runtime. ACP, Claude CLI, and CodeAgent adapters are future work.
+- The Rust bridge always registers the deterministic `mock` runtime and can optionally register an ACP v1 subprocess runtime through `DSH_RS_BRIDGE_ACP_COMMAND`. Vendor-specific Claude CLI and CodeAgent adapters remain future work.
 - This plugin replaces DSH's Native AgentLoop factory for its configured agents; do not load both factories in one DSH context.
 
 ## Type checking
@@ -45,3 +46,17 @@ From this directory:
 npm install
 npm run typecheck
 ```
+
+
+## Live event projection
+
+The adapter publishes DSH-native assistant frames through `agent/assistant-stream`.
+Each turn emits a `start` frame, zero or more `chunk` frames, and an `end`
+frame after its durable settlement commits. The compact timed chunk records are
+embedded in the final `assistant/message` or `assistant/attempt` event.
+
+External tool lifecycle events are published transiently through
+`agent/runtime-event` with `{ turn, step, event }`. The nested event carries
+the runtime ID, external session ID, event type, optional runtime sequence,
+payload, and timestamp. This avoids inventing DSH model tool-call/result
+semantics for tools executed internally by another agent runtime.

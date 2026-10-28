@@ -56,3 +56,13 @@ ACP session while the bridge process remains alive.
 The adapter currently reports `resume: false`: session IDs are retained only
 in memory, and the bridge cannot safely restore the external process binding
 after a restart. It does not advertise live input during an active prompt.
+
+
+## DSH TypeScript event projection
+
+Assistant text events are forwarded as process-local `agent/assistant-stream`
+frames and compacted into the final durable `assistant/message` /
+`assistant/attempt` stream. External tool lifecycle events are emitted through
+the transient `agent/runtime-event` event with the original runtime envelope.
+They are not currently converted into durable DSH `tool/call` and
+`tool/result` records.

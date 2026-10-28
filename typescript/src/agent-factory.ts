@@ -13,12 +13,15 @@ import type {
   ResumeAgentOptions,
   TurnBoundaryProjection,
 } from '@deepseek-ai/dsh-agent'
-import { createAssistantMessage } from '@deepseek-ai/dsh-llm'
+import { AssistantStreamAccumulator, createAssistantMessage, LlmAttemptId } from '@deepseek-ai/dsh-llm'
+import type { AssistantStreamRecord, StreamChunk } from '@deepseek-ai/dsh-llm'
+import type { AssistantStreamFrame } from '@deepseek-ai/dsh-agent'
 import { createScope, scopeTarget } from '@deepseek-ai/dsh-scope'
 import type { Scope } from '@deepseek-ai/dsh-scope'
 import {
   SessionLogOffset,
   SessionPreparation,
+  SessionSeq,
 } from '@deepseek-ai/dsh-session'
 import type {
   Session,
@@ -192,9 +195,9 @@ class DurableInbox implements Inbox {
 }
 
 /**
- * Minimal DSH Agent implementation whose turn execution is delegated to the Rust
- * runtime bridge. One external runtime turn maps to one DSH turn/step; tool-event
- * projection and live assistant-stream frames are intentionally deferred.
+ * DSH Agent implementation whose turn execution is delegated to the Rust
+ * runtime bridge. External text is published through DSH's process-local
+ * assistant-stream frames and compacted into the final durable Session event.
  */
 class RemoteRuntimeAgent implements Agent {
   readonly id: SessionId
@@ -213,6 +216,8 @@ class RemoteRuntimeAgent implements Agent {
   private currentExecutionActive = false
   private externalSessionId?: string
   private cancelCause?: AgentCancelCause
+  private streamRevision = 0
+  private attemptCounter = 0
 
   constructor(
     private readonly hostCtx: Context,
@@ -362,14 +367,64 @@ class RemoteRuntimeAgent implements Agent {
     this.session.append('user/message', message, { surfaceOp: 'append' })
     this.session.append('step/start', { turn, step })
 
+    const attemptId = LlmAttemptId(String(this.id) + ':' + String(++this.attemptCounter))
+    const accumulator = new AssistantStreamAccumulator()
+    let chunkIndex = 0
+    let streamEnded = false
+
+    this.notify('agent/assistant-stream', {
+      frame: {
+        type: 'start',
+        attemptId,
+        revision: ++this.streamRevision,
+        turn,
+        step,
+      } satisfies AssistantStreamFrame,
+    })
+
+    const pushChunk = (chunk: StreamChunk): void => {
+      const timed = accumulator.push({ time: Date.now(), chunk })
+      this.notify('agent/assistant-stream', {
+        frame: {
+          type: 'chunk',
+          attemptId,
+          revision: ++this.streamRevision,
+          index: chunkIndex++,
+          time: timed.time,
+          chunk: timed.chunk,
+        } satisfies AssistantStreamFrame,
+      })
+    }
+
+    const pushText = (chunkText: string): void => {
+      if (chunkText.length === 0) return
+      text += chunkText
+      pushChunk({ type: 'text-delta', index: 0, text: chunkText })
+    }
+
     const onRuntimeEvent = (notification: RuntimeNotification): void => {
       const event = notification.event
       if (event.dsh_session_id !== String(this.id)) return
       if (event.event_type === 'assistant.delta') {
-        text += outputText(event)
+        pushText(outputText(event))
       } else if (event.event_type === 'assistant.message' && text.length === 0) {
-        text = outputText(event)
-      } else if (event.event_type === 'turn.failed') {
+        pushText(outputText(event))
+      } else if (event.event_type.startsWith('tool.')) {
+        // Tool activity belongs to the external agent's execution trace. Keep it
+        // transient instead of fabricating DSH model tool-call/result semantics.
+        this.notify('agent/runtime-event', {
+          turn,
+          step,
+          event: {
+            runtime_id: event.runtime_id,
+            external_session_id: event.external_session_id,
+            event_type: event.event_type,
+            ...(event.runtime_seq === undefined ? {} : { runtime_seq: event.runtime_seq }),
+            payload: event.payload,
+            at_unix_ms: event.at_unix_ms,
+          },
+        })
+      } else if (event.event_type === 'turn.failed' || event.event_type === 'runtime.failed') {
         failureMessage = typeof event.payload.message === 'string'
           ? event.payload.message
           : 'external runtime reported a failed turn'
@@ -416,7 +471,36 @@ class RemoteRuntimeAgent implements Agent {
       this.bridge.off('runtime-event', onRuntimeEvent)
     }
 
+    const finishChunk: StreamChunk = terminalStatus === 'completed'
+      ? { type: 'finish', reason: { kind: 'stop' } }
+      : terminalStatus === 'cancelled'
+        ? {
+          type: 'finish',
+          reason: {
+            kind: 'aborted',
+            failure: {
+              message: failureMessage ?? 'external runtime cancelled',
+              code: 'CANCELLED',
+            },
+          },
+        }
+        : {
+          type: 'finish',
+          reason: {
+            kind: 'error',
+            failure: {
+              message: failureMessage ?? 'external runtime failed',
+              code: 'EXTERNAL_RUNTIME_FAILED',
+            },
+          },
+        }
+
     try {
+      pushChunk(finishChunk)
+      const stream = [...accumulator.snapshot()] as AssistantStreamRecord[]
+      let eventType: 'assistant/message' | 'assistant/attempt'
+      let settlementSeq: SessionSeq
+
       if (text.length > 0) {
         const assistantMessage = createAssistantMessage({
           content: [{ type: 'text', text }],
@@ -425,14 +509,30 @@ class RemoteRuntimeAgent implements Agent {
             model: this.runtimeId,
           },
         })
-        this.session.append('assistant/message', {
+        settlementSeq = this.session.append('assistant/message', {
           turn,
           step,
           message: assistantMessage,
-          stream: [],
+          stream,
           ...(terminalStatus === 'cancelled' ? { interrupted: true as const } : {}),
         }, { surfaceOp: 'append' })
+        eventType = 'assistant/message'
+      } else {
+        settlementSeq = this.session.append('assistant/attempt', { turn, step, stream })
+        eventType = 'assistant/attempt'
       }
+
+      this.notify('agent/assistant-stream', {
+        frame: {
+          type: 'end',
+          attemptId,
+          revision: ++this.streamRevision,
+          index: chunkIndex,
+          outcome: { kind: 'committed', eventType, seq: settlementSeq },
+        } satisfies AssistantStreamFrame,
+      })
+      streamEnded = true
+
       this.session.append('step/end', { turn, step })
       if (terminalStatus === 'completed') {
         this.session.append('turn/end', { turn, reason: { kind: 'completed' } })
@@ -457,6 +557,19 @@ class RemoteRuntimeAgent implements Agent {
         })
       }
       await this.appendUnstoredSuffix()
+    } catch (error) {
+      if (!streamEnded) {
+        this.notify('agent/assistant-stream', {
+          frame: {
+            type: 'end',
+            attemptId,
+            revision: ++this.streamRevision,
+            index: chunkIndex,
+            outcome: { kind: 'abandoned' },
+          } satisfies AssistantStreamFrame,
+        })
+      }
+      throw error
     } finally {
       this.currentExecutionActive = false
     }

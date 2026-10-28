@@ -57,3 +57,19 @@ The adapter's session control sends ACP cancellation notifications. The
 supervisor drains active turns first and then invokes each adapter's shutdown
 hook to release adapter-owned subprocesses. Resume is intentionally disabled
 until durable external-session binding and restart recovery are implemented.
+
+
+## DSH live event projection
+
+The TypeScript adapter publishes assistant output using the standard
+`agent/assistant-stream` lifecycle: `start`, timed `chunk` frames, then an
+`end` frame after the durable `assistant/message` or `assistant/attempt`
+settlement commits. The compact stream is stored in the settlement event; token
+frames themselves are process-local and are not appended as individual session
+events.
+
+External tool activity is published as transient `agent/runtime-event`
+notifications. The adapter does not fabricate DSH `tool/call` and
+`tool/result` records from another runtime's internal tool cycle, because DSH's
+durable tool-call semantics are tied to assistant tool-call blocks and matching
+call/result identities.

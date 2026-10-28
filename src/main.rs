@@ -233,6 +233,7 @@ async fn run_stdio() -> Result<(), RuntimeError> {
     supervisor.register(Arc::new(
         MockRuntime::new("mock")
             .with_continuation(true)
+            .with_tool_events(std::env::var("DSH_RS_BRIDGE_MOCK_TOOL_EVENTS").is_ok())
             .with_delay(Duration::from_millis(delay_ms)),
     ))?;
 

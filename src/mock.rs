@@ -16,6 +16,7 @@ pub struct MockRuntime {
     output: String,
     delay: Duration,
     continuation: bool,
+    tool_events: bool,
 }
 
 impl MockRuntime {
@@ -25,6 +26,7 @@ impl MockRuntime {
             output: "mock runtime completed the task".to_owned(),
             delay: Duration::from_millis(5),
             continuation: false,
+            tool_events: false,
         }
     }
 
@@ -40,6 +42,12 @@ impl MockRuntime {
 
     pub fn with_continuation(mut self, enabled: bool) -> Self {
         self.continuation = enabled;
+        self
+    }
+
+    /// Emit deterministic tool lifecycle events for adapter integration tests.
+    pub fn with_tool_events(mut self, enabled: bool) -> Self {
+        self.tool_events = enabled;
         self
     }
 
@@ -59,6 +67,7 @@ impl MockRuntime {
         output: String,
         delay: Duration,
         resumed: bool,
+        tool_events: bool,
     ) -> RuntimeSessionHandle {
         let (tx, rx) = mpsc::channel(32);
         let control = Arc::new(MockControl::new(tx));
@@ -73,6 +82,39 @@ impl MockRuntime {
                 .unwrap_or(false);
             if !emitted {
                 return;
+            }
+
+            if tool_events {
+                let emitted = task_control
+                    .emit(
+                        RuntimeEventType::ToolStarted,
+                        json!({
+                            "toolCallId": "mock-call-1",
+                            "title": "mock lookup",
+                            "status": "in_progress",
+                            "rawInput": { "query": "integration-test" }
+                        }),
+                    )
+                    .await
+                    .unwrap_or(false);
+                if !emitted {
+                    return;
+                }
+                let emitted = task_control
+                    .emit(
+                        RuntimeEventType::ToolCompleted,
+                        json!({
+                            "toolCallId": "mock-call-1",
+                            "title": "mock lookup",
+                            "status": "completed",
+                            "content": [{ "type": "text", "text": "mock tool result" }]
+                        }),
+                    )
+                    .await
+                    .unwrap_or(false);
+                if !emitted {
+                    return;
+                }
             }
 
             tokio::time::sleep(delay).await;
@@ -133,7 +175,13 @@ impl RuntimeAdapter for MockRuntime {
             ));
         }
         let external_session_id = format!("{}::{}", self.id, request.dsh_session_id);
-        Ok(self.spawn_turn(external_session_id, self.output.clone(), self.delay, false))
+        Ok(self.spawn_turn(
+            external_session_id,
+            self.output.clone(),
+            self.delay,
+            false,
+            self.tool_events,
+        ))
     }
 
     async fn resume(
@@ -150,6 +198,7 @@ impl RuntimeAdapter for MockRuntime {
             self.output.clone(),
             self.delay,
             true,
+            self.tool_events,
         ))
     }
 
@@ -172,6 +221,7 @@ impl RuntimeAdapter for MockRuntime {
             format!("continued: {}", request.prompt),
             self.delay,
             false,
+            self.tool_events,
         ))
     }
 }
