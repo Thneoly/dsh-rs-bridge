@@ -2,7 +2,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use dsh_rs_bridge::{
     AcpRuntime, AcpRuntimeConfig, MemoryEventSink, MemorySessionStore, RuntimeStatus,
-    RuntimeSupervisor, StartExecutionRequest,
+    RuntimeSupervisor, SessionStore, StartExecutionRequest,
 };
 use tokio_util::sync::CancellationToken;
 

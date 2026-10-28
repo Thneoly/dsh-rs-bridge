@@ -22,7 +22,6 @@ use tokio::{
     sync::{mpsc, oneshot, Mutex},
     time::timeout,
 };
-use tokio_util::sync::CancellationToken;
 
 use crate::contracts::{
     RuntimeAdapter, RuntimeCapabilities, RuntimeContinueRequest, RuntimeError, RuntimeEvent,
