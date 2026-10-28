@@ -38,6 +38,8 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+      - name: Check real ACP smoke script syntax
+        run: node --check scripts/acp-smoke.mjs
       - name: Install TypeScript integration dependencies
         working-directory: typescript
         run: npm install --no-audit --no-fund --legacy-peer-deps --package-lock=false
@@ -49,3 +51,30 @@ jobs:
         env:
           DSH_RS_BRIDGE_BIN: ${{ github.workspace }}/target/debug/dsh-rs-bridge
         run: npm test
+
+  real-acp-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Download OpenCode ACP agent and verify handshake
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/opencode.tar.gz"
+          install_dir="$RUNNER_TEMP/opencode"
+          mkdir -p "$install_dir"
+          curl --fail --location --silent --show-error \
+            https://opencode.ai/files/bin/2.2.0/opencode-linux-x64.tar.gz \
+            --output "$archive"
+          tar -xzf "$archive" -C "$install_dir"
+          binary="$(find "$install_dir" -type f -name opencode -print -quit)"
+          test -n "$binary"
+          chmod +x "$binary"
+          DSH_RS_BRIDGE_ACP_SMOKE_COMMAND="$binary" \
+            DSH_RS_BRIDGE_ACP_SMOKE_ARGS='["acp"]' \
+            DSH_RS_BRIDGE_ACP_SMOKE_TIMEOUT_MS=45000 \
+            node scripts/acp-smoke.mjs
