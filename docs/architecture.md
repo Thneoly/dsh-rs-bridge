@@ -8,16 +8,17 @@
 
 ## Ownership
 
-- DSH TypeScript remains the host and retains its AgentFactory, Native AgentLoop, and Session implementation.
-- This Rust process owns runtime adapter registration, external execution lifecycle, event ordering validation, and external-session binding.
-- A thin TypeScript bridge must map these events onto the exact DSH SessionEventMap before production use.
+- DSH TypeScript remains the host and retains its AgentRegistry and Session implementation.
+- The TypeScript plugin provides an alternate AgentFactory; do not load it together with the native AgentLoop plugin because DSH has one factory slot.
+- The Rust process owns runtime adapter registration, external execution lifecycle, event ordering validation, and external-session binding.
+- The TypeScript adapter maps external turn output and terminal status onto DSH Session events. Live assistant-stream frames and tool-call/result projection remain future work.
 - Runtime IDs and external session IDs are separate from DSH Session IDs.
 
 ## First milestone
 
-The initial server exposes a versioned JSONL protocol over stdio and registers a deterministic in-process Mock Runtime. The Mock Runtime proves the process boundary, lifecycle supervision, cancellation, resume identity, and event notifications before an ACP adapter is added.
+The Rust server exposes a versioned JSONL protocol over stdio and registers a deterministic in-process Mock Runtime. A process-level test exercises discovery, start, wait, continuation, cancellation, asynchronous notifications, and shutdown. The TypeScript plugin implements DSH AgentFactory creation, inbox projections, Session turn/step events, assistant output mapping, and disposal.
 
-The first server uses in-memory session storage. It does not promise process-restart recovery. Durable storage is a later milestone.
+The Rust bridge currently uses in-memory session storage. It does not promise process-restart recovery, so the TypeScript factory rejects DSH persisted-session resume until durable external-session bindings are implemented.
 
 ## Protocol
 
@@ -37,7 +38,7 @@ Supported methods:
 - session.resume
 - session.cancel
 - session.wait
-- session.send
+- session.send (live input or post-terminal continuation, depending on runtime capabilities)
 - bridge.shutdown
 
 The protocol is a project-local initial contract, not an existing DSH or ACP standard.

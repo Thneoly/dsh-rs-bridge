@@ -4,22 +4,21 @@ Rust runtime bridge prototype for DSH, grounded in the pinned DSH source baselin
 
 ## Goal
 
-Keep DSH's TypeScript Native AgentLoop intact while making external Agent Runtimes first-class execution backends. The bridge owns the runtime contract, adapter registry, lifecycle supervision, external session binding, and event notifications. A thin TypeScript adapter will eventually map the bridge protocol to the exact DSH Agent and Session contracts.
+Keep DSH core's AgentRegistry and Session implementation intact while making external Agent Runtimes first-class execution backends. The TypeScript plugin supplies an alternate DSH AgentFactory instead of loading the native AgentLoop plugin; the Rust process owns runtime adapter registration, external execution lifecycle, and external session binding.
 
 This is not a rewrite of DSH and does not confuse a model API provider with a full Agent Runtime.
 
 ## Current status
 
-Milestone 0: Rust contract, supervisor, deterministic Mock Runtime, versioned stdio JSONL server, and CI.
+Implemented: Rust runtime contract and supervisor, versioned stdio JSONL server, real-process integration test, multi-turn continuation semantics, and a TypeScript DSH AgentFactory/Session adapter with CI type-checking.
 
-In progress: real-process JSONL integration tests and multi-turn continuation semantics.
-
-Not implemented yet: ACP adapter, durable storage, and the TypeScript DSH Core integration.
+Not implemented yet: ACP/Claude CLI/CodeAgent adapters, durable external-session binding storage, live assistant-stream frames, external tool-event projection, and reliable DSH persisted-session resume.
 
 ## Requirements
 
 - Rust stable toolchain
 - Cargo
+- Node.js 22+ and npm for the TypeScript DSH integration
 
 ## Build and test
 
@@ -38,5 +37,7 @@ Start the stdio JSONL server:
     cargo run -- --stdio
 
 The server emits JSONL only on stdout. Keep logs and diagnostics on stderr.
+
+The DSH plugin lives in `typescript/`; see [its integration guide](typescript/README.md). The plugin must be loaded instead of `@deepseek-ai/dsh-agent-loop`, because DSH exposes one AgentFactory slot.
 
 See docs/architecture.md, docs/protocol.md, and docs/dsh-baseline.md.

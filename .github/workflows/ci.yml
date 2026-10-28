@@ -1,4 +1,4 @@
-name: Rust CI
+name: Rust and TypeScript CI
 
 on:
   push:
@@ -12,7 +12,7 @@ permissions:
   contents: read
 
 jobs:
-  test:
+  rust:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -26,3 +26,17 @@ jobs:
         run: cargo test --all-targets
       - name: Run Clippy
         run: cargo clippy --all-targets -- -D warnings
+
+  typescript:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install TypeScript integration dependencies
+        working-directory: typescript
+        run: npm install --no-audit --no-fund --legacy-peer-deps --package-lock=false
+      - name: Type-check DSH adapter
+        working-directory: typescript
+        run: npm run typecheck
