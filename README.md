@@ -122,6 +122,10 @@ DSH session, one continuous real-model conversation, driven through
   planted in the prompt;
 - **B** a same-session recall turn that must echo the codeword (verifies real
   conversational memory, not just session identity);
+- **T** a tool turn: the agent must read a marker file in the session cwd; if
+  it asks permission (force it with opencode's `permission.bash: ask`), the
+  gate answers allow via `permission.respond` and asserts the permission and
+  tool round-trip end to end;
 - **C** a mid-stream cancellation: cancel after the first streamed delta and
   require `turn.cancelled`;
 - **D** a durable-journal assertion: `sessions.jsonl` replay must match the
@@ -173,11 +177,15 @@ suffix:
 Tuning knobs: `DSH_RS_BRIDGE_GATE_RPC_TIMEOUT_MS` (short RPC budget, default
 20 s), `DSH_RS_BRIDGE_GATE_TURN_TIMEOUT_MS` (per-turn budget, default 300 s),
 `DSH_RS_BRIDGE_GATE_CANCEL_PROBE_TIMEOUT_MS` (how long to wait for the first
-delta before cancelling, default 30 s), `DSH_RS_BRIDGE_GATE_CANCEL_ATTEMPTS`
-(default 3, for models that finish before a delta can be cancelled),
-`DSH_RS_BRIDGE_GATE_KEEP=1` and `DSH_RS_BRIDGE_GATE_REPORT=<path>` to keep or
-copy the report on success.
+delta before cancelling, default 30 s),
+`DSH_RS_BRIDGE_GATE_PERMISSION_PROBE_TIMEOUT_MS` (how long to wait for a
+permission request on the tool turn, default 45 s),
+`DSH_RS_BRIDGE_GATE_CANCEL_ATTEMPTS` (default 3, for models that finish
+before a delta can be cancelled), `DSH_RS_BRIDGE_GATE_KEEP=1` and
+`DSH_RS_BRIDGE_GATE_REPORT=<path>` to keep or copy the report on success.
 
 The gate spends real model tokens; it is **not run by ordinary CI**. The
-bridge currently declines ACP permission requests, so turns whose tools
-require permission are denied — the gate prompts avoid mutating tool use.
+bridge forwards ACP permission requests to the host; the gate answers allow
+for the tool turn. Through the DSH plugin the answer comes from the
+configured `permissionPolicy` (deny by default) — see the TypeScript README.
+Unanswered requests are auto-denied after a bounded deadline.

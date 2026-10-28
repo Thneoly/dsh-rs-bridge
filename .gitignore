@@ -3,3 +3,5 @@
 *.log
 .dsh-rs-bridge/
 .tools/
+node_modules/
+typescript/dist/

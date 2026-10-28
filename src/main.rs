@@ -120,6 +120,13 @@ struct SendParams {
 }
 
 #[derive(Debug, Deserialize)]
+struct PermissionRespondParams {
+    dsh_session_id: String,
+    request_id: String,
+    option_id: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct ProbeParams {
     runtime_id: String,
 }
@@ -187,6 +194,17 @@ async fn dispatch(
             let params: SendParams = parse_params(&request.params)?;
             supervisor.send(&params.dsh_session_id, params.text).await?;
             Ok(json!({ "accepted": true }))
+        }
+        "permission.respond" => {
+            let params: PermissionRespondParams = parse_params(&request.params)?;
+            supervisor
+                .respond_permission(
+                    &params.dsh_session_id,
+                    &params.request_id,
+                    &params.option_id,
+                )
+                .await?;
+            Ok(json!({ "delivered": true }))
         }
         "bridge.shutdown" => {
             supervisor.shutdown().await?;
@@ -353,7 +371,8 @@ async fn main() {
                     "session.resume",
                     "session.cancel",
                     "session.wait",
-                    "session.send"
+                    "session.send",
+                    "permission.respond"
                 ]
             })
         ),

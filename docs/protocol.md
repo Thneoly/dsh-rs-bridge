@@ -29,14 +29,16 @@ The host_seq value is monotonic per DSH session and is assigned by the bridge. T
 - session.cancel: interrupt an active execution and wait for its terminal state.
 - session.wait: wait until the session reaches a terminal state.
 - session.send: send input to an active runtime if it advertises live_input; after a terminal turn, start a continuation on the same external session if continuation is supported.
+- permission.respond: answer a forwarded `permission.requested` event with `{dsh_session_id, request_id, option_id}`; requires a runtime advertising `permission_requests`.
 - bridge.shutdown: stop reading requests and exit.
 
 ## Events and terminal statuses
 
 Every runtime occurrence is forwarded to the host as a `runtime.event`
 notification. Adapter-emitted event types: `assistant.delta`,
-`assistant.message`, `tool.started`, `tool.completed`, `runtime.status`, and
-the terminal `turn.completed` / `turn.cancelled` / `turn.failed`. The
+`assistant.message`, `tool.started`, `tool.completed`, `runtime.status`,
+`permission.requested`, `permission.responded`, and the terminal
+`turn.completed` / `turn.cancelled` / `turn.failed`. The
 supervisor additionally synthesizes lifecycle events: `runtime.started`,
 `runtime.continued`, `runtime.resumed`, `runtime.session_restored`,
 `runtime.interrupted`, `runtime.restore_failed`, `runtime.failed`,
@@ -58,8 +60,6 @@ sequence as an independent stream.
 
 - The protocol is request/notification JSONL, not a complete JSON-RPC 2.0 implementation.
 - Continuation reuses the same external session ID but starts a new runtime attachment; active in-flight input is a separate capability (live_input).
-- ACP permission requests (`session/request_permission`) are declined
-  automatically; there is no host round-trip for permission decisions yet.
 - Execution events are forwarded to the host only; the bridge persists session
   bindings, not a durable event history.
 
@@ -76,6 +76,18 @@ ACP `session/update` notifications are translated into runtime events:
 assistant chunks/messages, tool-call updates, and status updates. Cancellation
 is forwarded using `session/cancel`. A completed turn can continue on the same
 ACP session while the bridge process remains alive.
+
+Permission interaction: an agent's `session/request_permission` is forwarded
+to the host as a `permission.requested` event (payload: `request_id`,
+`session_id`, `tool_call`, `options`). The host answers through
+`permission.respond` with one of the offered `option_id` values; the delivered
+decision is reported back as `permission.responded` (payload `request_id`,
+`source` of `host` | `timeout` | `cancelled`, and `option_id` when an option
+was selected). If the host does not answer within the adapter's bounded
+deadline (default 300 s, configurable), the adapter auto-denies by selecting
+the first reject-kind option — a permission never holds a turn hostage.
+Cancelling a turn resolves outstanding permission requests with the
+`cancelled` outcome, as the ACP spec requires.
 
 The adapter reports `resume: false` (the in-place resume RPC stays disabled)
 but `session_restore: true`: after a bridge restart, `session.restore` spawns a

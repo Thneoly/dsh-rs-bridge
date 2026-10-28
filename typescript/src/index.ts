@@ -20,6 +20,12 @@ export interface Config {
   runtimeId: string
   requestTimeoutMs: number
   shutdownTimeoutMs: number
+  /** How forwarded runtime permission requests are answered automatically:
+   * 'deny' (safe default) or 'allow'. */
+  permissionPolicy: 'deny' | 'allow'
+  /** Budget for one external turn; session.wait/cancel use this instead of
+   * the short request timeout. Default matches the bridge prompt budget. */
+  turnTimeoutMs: number
 }
 
 export const Config: z<Config> = z.object({
@@ -30,6 +36,8 @@ export const Config: z<Config> = z.object({
   runtimeId: z.string().default('mock'),
   requestTimeoutMs: z.number().default(30000),
   shutdownTimeoutMs: z.number().default(3000),
+  permissionPolicy: z.union([z.const('deny'), z.const('allow')]).default('deny'),
+  turnTimeoutMs: z.number().default(3600000),
 })
 
 export function apply(ctx: Context, config: Config): void {
@@ -44,6 +52,8 @@ export function apply(ctx: Context, config: Config): void {
   const factoryConfig: RuntimeBridgeFactoryConfig = {
     ...processConfig,
     runtimeId: config.runtimeId,
+    permissionPolicy: config.permissionPolicy,
+    turnTimeoutMs: config.turnTimeoutMs,
   }
   const bridge = new JsonlBridgeClient(ctx, processConfig)
   const factory = new BridgeAgentFactory(ctx, bridge, factoryConfig)

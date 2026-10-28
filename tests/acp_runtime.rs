@@ -366,6 +366,248 @@ async fn acp_stdin_wedge_write_times_out_and_kills_agent() {
     supervisor.shutdown().await.expect("shutdown after wedge");
 }
 
+/// Poll until a permission.requested event lands for the session; returns the
+/// event payload.
+async fn eventually_permission(
+    events: &Arc<MemoryEventSink>,
+    session_id: &str,
+) -> Option<serde_json::Value> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let observed = events.events_for(session_id).await.iter().find_map(|item| {
+            if item.event.event_type == "permission.requested" {
+                Some(item.event.payload.clone())
+            } else {
+                None
+            }
+        });
+        if let Some(payload) = observed {
+            return Some(payload);
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+fn acp_config() -> AcpRuntimeConfig {
+    AcpRuntimeConfig::new(env!("CARGO_BIN_EXE_acp-test-agent"))
+        .with_id("acp-test")
+        .with_env(HashMap::new())
+}
+
+#[tokio::test]
+async fn acp_permission_allow_enables_tool_run() {
+    let sessions = Arc::new(MemorySessionStore::default());
+    let events = Arc::new(MemoryEventSink::default());
+    let supervisor = RuntimeSupervisor::new(sessions, events.clone());
+    supervisor
+        .register(Arc::new(AcpRuntime::new(acp_config())))
+        .expect("register ACP runtime");
+
+    supervisor
+        .start(request("acp-perm-allow", "needs-permission"))
+        .await
+        .expect("start permission session");
+    let payload = eventually_permission(&events, "acp-perm-allow")
+        .await
+        .expect("permission request must be forwarded to the host");
+    let request_id = payload["request_id"]
+        .as_str()
+        .expect("request id")
+        .to_owned();
+
+    supervisor
+        .respond_permission("acp-perm-allow", &request_id, "allow_once")
+        .await
+        .expect("deliver allow decision");
+
+    let finished = wait_for_terminal_status(&supervisor, "acp-perm-allow").await;
+    assert_eq!(finished.status, RuntimeStatus::Completed);
+    let stream = events.events_for("acp-perm-allow").await;
+    assert!(
+        stream
+            .iter()
+            .any(|item| item.event.event_type == "tool.started"),
+        "allowed permission must surface the tool lifecycle"
+    );
+    assert!(
+        stream
+            .iter()
+            .any(|item| item.event.event_type == "tool.completed"),
+        "allowed permission must surface tool completion"
+    );
+    assert!(
+        stream.iter().any(|item| {
+            item.event.event_type == "permission.responded"
+                && item.event.payload["source"] == "host"
+                && item.event.payload["option_id"] == "allow_once"
+        }),
+        "host decision must be reported as permission.responded"
+    );
+    assert!(
+        stream.iter().any(|item| {
+            item.event.event_type == "assistant.delta"
+                && item.event.payload["text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("tool ran"))
+        }),
+        "allowed tool must feed the assistant output"
+    );
+
+    supervisor.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn acp_permission_denied_skips_tool() {
+    let sessions = Arc::new(MemorySessionStore::default());
+    let events = Arc::new(MemoryEventSink::default());
+    let supervisor = RuntimeSupervisor::new(sessions, events.clone());
+    supervisor
+        .register(Arc::new(AcpRuntime::new(acp_config())))
+        .expect("register ACP runtime");
+
+    supervisor
+        .start(request("acp-perm-deny", "needs-permission"))
+        .await
+        .expect("start permission session");
+    let payload = eventually_permission(&events, "acp-perm-deny")
+        .await
+        .expect("permission request must be forwarded");
+    let request_id = payload["request_id"]
+        .as_str()
+        .expect("request id")
+        .to_owned();
+
+    supervisor
+        .respond_permission("acp-perm-deny", &request_id, "reject_once")
+        .await
+        .expect("deliver deny decision");
+
+    let finished = wait_for_terminal_status(&supervisor, "acp-perm-deny").await;
+    assert_eq!(finished.status, RuntimeStatus::Completed);
+    let stream = events.events_for("acp-perm-deny").await;
+    assert!(
+        !stream
+            .iter()
+            .any(|item| item.event.event_type == "tool.started"),
+        "denied permission must not run the tool"
+    );
+    assert!(
+        stream.iter().any(|item| {
+            item.event.event_type == "assistant.delta"
+                && item.event.payload["text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("permission denied"))
+        }),
+        "denied permission must be visible in the assistant output"
+    );
+
+    supervisor.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn acp_permission_timeout_auto_denies() {
+    let sessions = Arc::new(MemorySessionStore::default());
+    let events = Arc::new(MemoryEventSink::default());
+    let supervisor = RuntimeSupervisor::new(sessions, events.clone());
+    let config = acp_config().with_permission_timeout(Duration::from_millis(300));
+    supervisor
+        .register(Arc::new(AcpRuntime::new(config)))
+        .expect("register ACP runtime");
+
+    supervisor
+        .start(request("acp-perm-timeout", "needs-permission"))
+        .await
+        .expect("start permission session");
+    assert!(
+        eventually_permission(&events, "acp-perm-timeout")
+            .await
+            .is_some(),
+        "permission request must be forwarded before the deadline"
+    );
+
+    // The host never answers: the adapter must auto-deny and finish the turn.
+    let finished = wait_for_terminal_status(&supervisor, "acp-perm-timeout").await;
+    assert_eq!(finished.status, RuntimeStatus::Completed);
+    let stream = events.events_for("acp-perm-timeout").await;
+    assert!(
+        stream.iter().any(|item| {
+            item.event.event_type == "permission.responded"
+                && item.event.payload["source"] == "timeout"
+        }),
+        "timeout auto-deny must be reported as permission.responded"
+    );
+    assert!(
+        !stream
+            .iter()
+            .any(|item| item.event.event_type == "tool.started"),
+        "timed-out permission must not run the tool"
+    );
+
+    supervisor.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn acp_permission_pending_cancel_settles_turn() {
+    let sessions = Arc::new(MemorySessionStore::default());
+    let events = Arc::new(MemoryEventSink::default());
+    let supervisor = RuntimeSupervisor::new(sessions, events.clone());
+    supervisor
+        .register(Arc::new(AcpRuntime::new(acp_config())))
+        .expect("register ACP runtime");
+
+    supervisor
+        .start(request("acp-perm-cancel", "needs-permission"))
+        .await
+        .expect("start permission session");
+    let payload = eventually_permission(&events, "acp-perm-cancel")
+        .await
+        .expect("permission request must be forwarded");
+    let request_id = payload["request_id"]
+        .as_str()
+        .expect("request id")
+        .to_owned();
+
+    // Cancelling while a permission is pending must settle BOTH the pending
+    // request (cancelled outcome, as the ACP spec requires) and the turn,
+    // within the interrupt deadline — not the 300 s permission deadline.
+    let cancelled = timeout(
+        Duration::from_secs(10),
+        supervisor.interrupt("acp-perm-cancel", "cancel while permission pending"),
+    )
+    .await
+    .expect("interrupt must be bounded while a permission is pending")
+    .expect("interrupt must converge");
+    assert_eq!(cancelled.status, RuntimeStatus::Cancelled);
+    let stream = events.events_for("acp-perm-cancel").await;
+    assert!(
+        stream.iter().any(|item| {
+            item.event.event_type == "permission.responded"
+                && item.event.payload["source"] == "cancelled"
+        }),
+        "cancelling must resolve the pending permission with source=cancelled"
+    );
+    assert!(
+        stream
+            .iter()
+            .any(|item| item.event.event_type == "turn.cancelled"),
+        "the turn itself must settle as cancelled"
+    );
+
+    // The settled request must not be answerable a second time.
+    let refused = supervisor
+        .respond_permission("acp-perm-cancel", &request_id, "allow_once")
+        .await;
+    assert!(
+        refused.is_err(),
+        "responding to an already-settled permission must fail, got: {refused:?}"
+    );
+
+    supervisor.shutdown().await.expect("shutdown");
+}
+
 #[tokio::test]
 async fn interrupt_is_bounded_when_agent_ignores_cancellation() {
     let sessions = Arc::new(MemorySessionStore::default());
