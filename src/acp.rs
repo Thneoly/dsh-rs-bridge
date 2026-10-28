@@ -133,10 +133,7 @@ impl AcpRuntime {
             }
         };
 
-        if initialized
-            .get("protocolVersion")
-            .and_then(Value::as_u64)
-            != Some(ACP_PROTOCOL_VERSION)
+        if initialized.get("protocolVersion").and_then(Value::as_u64) != Some(ACP_PROTOCOL_VERSION)
         {
             process.stop().await;
             return Err(RuntimeError::Protocol(format!(
@@ -219,7 +216,9 @@ impl RuntimeAdapter for AcpRuntime {
         match self.ensure_configured() {
             Ok(()) => RuntimeHealth {
                 status: RuntimeHealthStatus::Ready,
-                detail: Some("ACP v1 subprocess configured; availability is checked on launch".to_owned()),
+                detail: Some(
+                    "ACP v1 subprocess configured; availability is checked on launch".to_owned(),
+                ),
             },
             Err(error) => RuntimeHealth {
                 status: RuntimeHealthStatus::Unavailable,
@@ -296,7 +295,8 @@ impl RuntimeAdapter for AcpRuntime {
     }
 
     async fn shutdown(&self) -> Result<(), RuntimeError> {
-        let sessions: Vec<Arc<AcpSession>> = self.sessions.lock().await.drain().map(|(_, s)| s).collect();
+        let sessions: Vec<Arc<AcpSession>> =
+            self.sessions.lock().await.drain().map(|(_, s)| s).collect();
         for session in sessions {
             session.shutdown().await;
         }
@@ -304,7 +304,10 @@ impl RuntimeAdapter for AcpRuntime {
     }
 }
 
-fn resolve_cwd(request_cwd: Option<&str>, config_cwd: Option<&Path>) -> Result<PathBuf, RuntimeError> {
+fn resolve_cwd(
+    request_cwd: Option<&str>,
+    config_cwd: Option<&Path>,
+) -> Result<PathBuf, RuntimeError> {
     let cwd = request_cwd
         .map(PathBuf::from)
         .or_else(|| config_cwd.map(Path::to_path_buf))
@@ -463,10 +466,8 @@ impl AcpSession {
         // session/close. Process termination remains the final cleanup guarantee.
         let _ = timeout(
             Duration::from_secs(2),
-            self.process.request(
-                "session/close",
-                json!({ "sessionId": self.acp_session_id }),
-            ),
+            self.process
+                .request("session/close", json!({ "sessionId": self.acp_session_id })),
         )
         .await;
         self.process.stop().await;
@@ -535,12 +536,14 @@ impl AcpProcess {
                 config.command
             ))
         })?;
-        let stdin = child.stdin.take().ok_or_else(|| {
-            RuntimeError::Transport("ACP child stdin was not piped".to_owned())
-        })?;
-        let stdout = child.stdout.take().ok_or_else(|| {
-            RuntimeError::Transport("ACP child stdout was not piped".to_owned())
-        })?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| RuntimeError::Transport("ACP child stdin was not piped".to_owned()))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| RuntimeError::Transport("ACP child stdout was not piped".to_owned()))?;
 
         let process = Arc::new(Self {
             child: Mutex::new(child),
@@ -559,7 +562,9 @@ impl AcpProcess {
 
     async fn request(&self, method: &str, params: Value) -> Result<Value, RuntimeError> {
         if self.stopped.load(Ordering::SeqCst) {
-            return Err(RuntimeError::Transport("ACP process has stopped".to_owned()));
+            return Err(RuntimeError::Transport(
+                "ACP process has stopped".to_owned(),
+            ));
         }
         let id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
@@ -607,8 +612,8 @@ impl AcpProcess {
     }
 
     async fn write_message(&self, message: Value) -> Result<(), RuntimeError> {
-        let mut line =
-            serde_json::to_vec(&message).map_err(|error| RuntimeError::Protocol(error.to_string()))?;
+        let mut line = serde_json::to_vec(&message)
+            .map_err(|error| RuntimeError::Protocol(error.to_string()))?;
         line.push(b'\n');
         let mut stdin = self.stdin.lock().await;
         let writer = stdin
@@ -707,7 +712,10 @@ impl AcpProcess {
             let result = if let Some(error) = message.get("error") {
                 Err(RuntimeError::Transport(format!(
                     "ACP JSON-RPC error {}: {}",
-                    error.get("code").map(Value::to_string).unwrap_or_else(|| "unknown".to_owned()),
+                    error
+                        .get("code")
+                        .map(Value::to_string)
+                        .unwrap_or_else(|| "unknown".to_owned()),
                     error
                         .get("message")
                         .and_then(Value::as_str)

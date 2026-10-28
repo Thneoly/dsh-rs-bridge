@@ -24,36 +24,67 @@ async fn acp_subprocess_streams_output_continues_and_cancels() {
     let config = AcpRuntimeConfig::new(env!("CARGO_BIN_EXE_acp-test-agent"))
         .with_id("acp-test")
         .with_env(HashMap::new());
-    supervisor.register(Arc::new(AcpRuntime::new(config))).expect("register ACP runtime");
+    supervisor
+        .register(Arc::new(AcpRuntime::new(config)))
+        .expect("register ACP runtime");
 
-    let first = supervisor.start(request("acp-session-1", "hello")).await.expect("start ACP session");
+    let first = supervisor
+        .start(request("acp-session-1", "hello"))
+        .await
+        .expect("start ACP session");
     assert_eq!(first.status, RuntimeStatus::Running);
     let first_external_id = first.external_session_id.clone().expect("external session id");
-    let finished = supervisor.wait_for_terminal("acp-session-1").await.expect("wait for first turn");
+    let finished = supervisor
+        .wait_for_terminal("acp-session-1")
+        .await
+        .expect("wait for first turn");
     assert_eq!(finished.status, RuntimeStatus::Completed);
 
     let first_events = events.events_for("acp-session-1").await;
-    assert!(first_events.iter().any(|event| {
-        event.event.event_type == "assistant.delta"
-            && event.event.payload["text"] == "ACP says: hello"
-    }), "ACP session/update must become an assistant delta");
+    assert!(
+        first_events.iter().any(|event| {
+            event.event.event_type == "assistant.delta"
+                && event.event.payload["text"] == "ACP says: hello"
+        }),
+        "ACP session/update must become an assistant delta"
+    );
 
-    supervisor.send("acp-session-1", "second prompt".to_owned()).await.expect("continue existing ACP session");
-    let continued = supervisor.wait_for_terminal("acp-session-1").await.expect("wait for continuation");
+    supervisor
+        .send("acp-session-1", "second prompt".to_owned())
+        .await
+        .expect("continue existing ACP session");
+    let continued = supervisor
+        .wait_for_terminal("acp-session-1")
+        .await
+        .expect("wait for continuation");
     assert_eq!(continued.status, RuntimeStatus::Completed);
-    let record = sessions.get("acp-session-1").await.expect("session store").expect("session record");
+    let record = sessions
+        .get("acp-session-1")
+        .await
+        .expect("session store")
+        .expect("session record");
     assert_eq!(record.external_session_id.as_deref(), Some(first_external_id.as_str()));
     assert!(events.events_for("acp-session-1").await.iter().any(|event| {
         event.event.event_type == "assistant.delta"
             && event.event.payload["text"] == "ACP says: second prompt"
     }));
 
-    supervisor.start(request("acp-session-cancel", "cancel-me")).await.expect("start cancellable ACP session");
-    let cancelled = supervisor.interrupt("acp-session-cancel", "integration test").await.expect("cancel ACP prompt");
+    supervisor
+        .start(request("acp-session-cancel", "cancel-me"))
+        .await
+        .expect("start cancellable ACP session");
+    let cancelled = supervisor
+        .interrupt("acp-session-cancel", "integration test")
+        .await
+        .expect("cancel ACP prompt");
     assert_eq!(cancelled.status, RuntimeStatus::Cancelled);
-    assert!(events.events_for("acp-session-cancel").await.iter().any(|event| {
-        event.event.event_type == "turn.cancelled"
-    }));
+    assert!(
+        events
+            .events_for("acp-session-cancel")
+            .await
+            .iter()
+            .any(|event| event.event.event_type == "turn.cancelled")
+    );
 
     supervisor.shutdown().await.expect("shutdown ACP subprocesses");
 }
