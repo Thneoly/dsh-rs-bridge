@@ -160,7 +160,10 @@ fn jsonl_process_supports_runtime_discovery_start_wait_continue_cancel_and_shutd
         json!({
             "dsh_session_id": "cancel-session",
             "runtime_id": "mock",
-            "prompt": "cancel this",
+            // The hang marker keeps the turn from self-completing, so the
+            // cancel below deterministically interrupts a live turn instead
+            // of racing the mock delay window.
+            "prompt": "hang: cancel this",
             "cwd": null
         }),
     );
