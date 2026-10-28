@@ -1,9 +1,9 @@
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use dsh_rs_bridge::{
-    AcpRuntime, AcpRuntimeConfig, ExecutionEventEnvelope, ExecutionEventSink,
-    MemorySessionStore, MockRuntime, PersistedExecutionEvent, ResumeExecutionRequest,
-    RuntimeError, RuntimeSupervisor, StartExecutionRequest,
+    AcpRuntime, AcpRuntimeConfig, ExecutionEventEnvelope, ExecutionEventSink, MemorySessionStore,
+    MockRuntime, PersistedExecutionEvent, ResumeExecutionRequest, RuntimeError, RuntimeSupervisor,
+    StartExecutionRequest,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -253,11 +253,12 @@ async fn run_stdio() -> Result<(), RuntimeError> {
                 }
             }
             if let Ok(env) = std::env::var("DSH_RS_BRIDGE_ACP_ENV") {
-                config.env = serde_json::from_str::<HashMap<String, String>>(&env).map_err(
-                    |error| RuntimeError::Configuration(format!(
-                        "DSH_RS_BRIDGE_ACP_ENV must be a JSON string map: {error}"
-                    )),
-                )?;
+                config.env =
+                    serde_json::from_str::<HashMap<String, String>>(&env).map_err(|error| {
+                        RuntimeError::Configuration(format!(
+                            "DSH_RS_BRIDGE_ACP_ENV must be a JSON string map: {error}"
+                        ))
+                    })?;
             }
             supervisor.register(Arc::new(AcpRuntime::new(config)))?;
         }
