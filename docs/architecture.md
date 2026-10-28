@@ -11,14 +11,19 @@
 - DSH TypeScript remains the host and retains its AgentRegistry and Session implementation.
 - The TypeScript plugin provides an alternate AgentFactory; do not load it together with the native AgentLoop plugin because DSH has one factory slot.
 - The Rust process owns runtime adapter registration, external execution lifecycle, event ordering validation, and external-session binding.
-- The TypeScript adapter maps external turn output and terminal status onto DSH Session events. Live assistant-stream frames and tool-call/result projection remain future work.
+- The TypeScript adapter maps external turn output and terminal status onto DSH Session events and publishes live assistant-stream frames. Durable tool-call/result projection from external runtimes remains deliberately deferred (see "DSH live event projection").
 - Runtime IDs and external session IDs are separate from DSH Session IDs.
 
-## First milestone
+## Verification story
 
-The Rust server exposes a versioned JSONL protocol over stdio and registers a deterministic in-process Mock Runtime. A process-level test exercises discovery, start, wait, continuation, cancellation, asynchronous notifications, and shutdown. The TypeScript plugin implements DSH AgentFactory creation, inbox projections, Session turn/step events, assistant output mapping, and disposal.
+The Rust server exposes a versioned JSONL protocol over stdio and registers a deterministic in-process Mock Runtime alongside the optional ACP adapter. Process-level tests exercise discovery, start, wait, continuation, deterministic cancellation, asynchronous notifications, journal repair, and shutdown against the real binary. The TypeScript plugin implements DSH AgentFactory creation, inbox projections, Session turn/step events, assistant output mapping, and disposal, verified by fixture-driven integration tests.
 
-The Rust bridge currently uses in-memory session storage. It does not promise process-restart recovery, so the TypeScript factory rejects DSH persisted-session resume until durable external-session bindings are implemented.
+Beyond fixtures, `scripts/bridge-acp-e2e.mjs` is an opt-in, credentialed
+full-conversation acceptance gate against a real ACP agent. It drives one
+continuous conversation through streaming, same-session recall, mid-stream
+cancellation, durable-journal assertions, and a bridge restart with
+`session.restore` plus post-restore recall. It is run manually (it spends real
+model tokens); CI covers the agent handshake and fixture-based execution only.
 
 ## Protocol
 
@@ -55,8 +60,10 @@ shutdown, preserving in-process conversation continuity.
 
 The adapter's session control sends ACP cancellation notifications. The
 supervisor drains active turns first and then invokes each adapter's shutdown
-hook to release adapter-owned subprocesses. Resume is intentionally disabled
-until durable external-session binding and restart recovery are implemented.
+hook to release adapter-owned subprocesses. The in-place resume RPC stays
+disabled by design; restart recovery goes through `session.restore`, which
+reattaches the persisted binding instead of claiming to resume an interrupted
+in-flight turn.
 
 
 ## DSH live event projection

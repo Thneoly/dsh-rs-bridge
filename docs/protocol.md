@@ -31,13 +31,37 @@ The host_seq value is monotonic per DSH session and is assigned by the bridge. T
 - session.send: send input to an active runtime if it advertises live_input; after a terminal turn, start a continuation on the same external session if continuation is supported.
 - bridge.shutdown: stop reading requests and exit.
 
+## Events and terminal statuses
+
+Every runtime occurrence is forwarded to the host as a `runtime.event`
+notification. Adapter-emitted event types: `assistant.delta`,
+`assistant.message`, `tool.started`, `tool.completed`, `runtime.status`, and
+the terminal `turn.completed` / `turn.cancelled` / `turn.failed`. The
+supervisor additionally synthesizes lifecycle events: `runtime.started`,
+`runtime.continued`, `runtime.resumed`, `runtime.session_restored`,
+`runtime.interrupted`, `runtime.restore_failed`, `runtime.failed`,
+`runtime.ended`, and `runtime.cleanup_failed`.
+
+Session records move through the statuses `starting` and `running` and settle
+on exactly one terminal status: `completed`, `cancelled`, or `failed`. A
+terminal record accepts `session.send` continuation. `session.restore`
+accepts both terminal and non-terminal records: a `starting` or `running`
+record is first closed as failed with `runtime.interrupted`, then reattached.
+`session.send` while a turn is still active requires the `live_input`
+capability (no shipped runtime advertises it today).
+
+`host_seq` is monotonic per DSH session within one bridge process. It restarts
+at 1 after a bridge restart; hosts that reconnect must treat the new process's
+sequence as an independent stream.
+
 ## Current limitations
 
-- Only the deterministic mock runtime is registered by the initial server.
-- Session bindings are in memory and are lost when the process exits.
-- Continuation reuses the same external session ID but starts a new runtime attachment; active in-flight input is a separate capability (live_input).
 - The protocol is request/notification JSONL, not a complete JSON-RPC 2.0 implementation.
-- ACP and vendor-specific CLI adapters are not implemented yet.
+- Continuation reuses the same external session ID but starts a new runtime attachment; active in-flight input is a separate capability (live_input).
+- ACP permission requests (`session/request_permission`) are declined
+  automatically; there is no host round-trip for permission decisions yet.
+- Execution events are forwarded to the host only; the bridge persists session
+  bindings, not a durable event history.
 
 
 ## ACP adapter
@@ -53,9 +77,12 @@ assistant chunks/messages, tool-call updates, and status updates. Cancellation
 is forwarded using `session/cancel`. A completed turn can continue on the same
 ACP session while the bridge process remains alive.
 
-The adapter currently reports `resume: false`: session IDs are retained only
-in memory, and the bridge cannot safely restore the external process binding
-after a restart. It does not advertise live input during an active prompt.
+The adapter reports `resume: false` (the in-place resume RPC stays disabled)
+but `session_restore: true`: after a bridge restart, `session.restore` spawns a
+fresh agent process and reattaches the persisted external conversation via
+`session/resume` (or `session/load` when the agent advertises `loadSession`
+without resume support). It does not advertise live input during an active
+prompt.
 
 
 ## DSH TypeScript event projection
