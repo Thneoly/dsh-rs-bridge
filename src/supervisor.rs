@@ -1,7 +1,10 @@
 use std::{
     collections::{HashMap, HashSet},
-    sync::{Arc, RwLock},
-    time::{SystemTime, UNIX_EPOCH},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, RwLock,
+    },
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use serde_json::json;
@@ -28,6 +31,7 @@ struct SupervisorInner {
     events: Arc<dyn ExecutionEventSink>,
     active: Mutex<HashMap<String, Arc<ActiveExecution>>>,
     reservations: Mutex<HashSet<String>>,
+    shutting_down: AtomicBool,
 }
 
 #[derive(Clone)]
@@ -44,6 +48,7 @@ impl RuntimeSupervisor {
                 events,
                 active: Mutex::new(HashMap::new()),
                 reservations: Mutex::new(HashSet::new()),
+                shutting_down: AtomicBool::new(false),
             }),
         }
     }
@@ -92,6 +97,53 @@ impl RuntimeSupervisor {
         }
         descriptors.sort_by(|a, b| a.id.cmp(&b.id));
         Ok(descriptors)
+    }
+
+    /// Stop accepting new executions, interrupt active sessions, and wait for terminal states.
+    pub async fn shutdown(&self) -> Result<(), RuntimeError> {
+        self.inner.shutting_down.store(true, Ordering::SeqCst);
+        loop {
+            let has_reservations = !self.inner.reservations.lock().await.is_empty();
+            if !has_reservations {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        let active: Vec<(String, Arc<ActiveExecution>)> = self
+            .inner
+            .active
+            .lock()
+            .await
+            .iter()
+            .map(|(session_id, execution)| (session_id.clone(), execution.clone()))
+            .collect();
+
+        for (session_id, execution) in active {
+            if execution.capabilities.interrupt {
+                if execution.control.interrupt("bridge shutdown").await.is_err() {
+                    let _ = execution.control.close().await;
+                }
+            } else {
+                let _ = execution.control.close().await;
+            }
+
+            match tokio::time::timeout(
+                Duration::from_secs(3),
+                self.wait_for_terminal(&session_id),
+            )
+            .await
+            {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => return Err(error),
+                Err(_) => {
+                    return Err(RuntimeError::Transport(format!(
+                        "timed out shutting down runtime session: {session_id}"
+                    )));
+                }
+            }
+        }
+        Ok(())
     }
 
     pub async fn start(
@@ -431,6 +483,9 @@ impl RuntimeSupervisor {
 
     async fn reserve(&self, dsh_session_id: &str) -> Result<(), RuntimeError> {
         let mut reservations = self.inner.reservations.lock().await;
+        if self.inner.shutting_down.load(Ordering::SeqCst) {
+            return Err(RuntimeError::Lifecycle("runtime bridge is shutting down".to_owned()));
+        }
         if reservations.contains(dsh_session_id) {
             return Err(RuntimeError::Lifecycle(format!(
                 "session is already starting or resuming: {dsh_session_id}"

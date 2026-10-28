@@ -10,6 +10,7 @@ use serde_json::{json, Value};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     sync::Mutex,
+    task::JoinSet,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -182,7 +183,10 @@ async fn dispatch(
             supervisor.send(&params.dsh_session_id, params.text).await?;
             Ok(json!({ "accepted": true }))
         }
-        "bridge.shutdown" => Ok(json!({ "stopping": true })),
+        "bridge.shutdown" => {
+            supervisor.shutdown().await?;
+            Ok(json!({ "stopping": true }))
+        }
         method => Err(RuntimeError::Configuration(format!(
             "unknown method: {method}"
         ))),
@@ -226,6 +230,7 @@ async fn run_stdio() -> Result<(), RuntimeError> {
 
     let stdin = tokio::io::stdin();
     let mut lines = BufReader::new(stdin).lines();
+    let mut pending = JoinSet::new();
     while let Some(line) = lines
         .next_line()
         .await
@@ -261,11 +266,25 @@ async fn run_stdio() -> Result<(), RuntimeError> {
             .await?;
             continue;
         }
+
         let shutdown = request.method == "bridge.shutdown";
-        let result = dispatch(&supervisor, &request).await;
-        write_response(&writer, &id, result).await?;
+        let task_writer = writer.clone();
+        let task_supervisor = supervisor.clone();
+        pending.spawn(async move {
+            let id = request.id.clone();
+            let result = dispatch(&task_supervisor, &request).await;
+            if let Err(error) = write_response(&task_writer, &id, result).await {
+                eprintln!("dsh-rs-bridge: response write failed: {error}");
+            }
+        });
         if shutdown {
             break;
+        }
+    }
+
+    while let Some(result) = pending.join_next().await {
+        if let Err(error) = result {
+            eprintln!("dsh-rs-bridge: request task failed: {error}");
         }
     }
     Ok(())
