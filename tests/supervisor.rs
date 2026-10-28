@@ -159,8 +159,7 @@ async fn concurrent_sessions_are_isolated() {
 
 #[tokio::test]
 async fn continuation_starts_a_new_turn_with_the_same_external_session() {
-    let (supervisor, sessions, events) =
-        setup_with_continuation(Duration::from_millis(1), true);
+    let (supervisor, sessions, events) = setup_with_continuation(Duration::from_millis(1), true);
     let first = supervisor
         .start(request("session-continue"))
         .await

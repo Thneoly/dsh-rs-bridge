@@ -137,8 +137,7 @@ fn jsonl_process_supports_runtime_discovery_start_wait_continue_cancel_and_shutd
     );
     assert_eq!(second_terminal["status"], "completed");
     assert_eq!(
-        second_terminal["external_session_id"],
-        external_session_id,
+        second_terminal["external_session_id"], external_session_id,
         "continuation must retain the runtime-owned session identity"
     );
 
@@ -181,9 +180,7 @@ fn jsonl_process_supports_runtime_discovery_start_wait_continue_cancel_and_shutd
         match event["event_type"].as_str() {
             Some("runtime.started") => saw_started = true,
             Some("runtime.continued") => saw_continued = true,
-            Some("assistant.delta")
-                if event["payload"]["text"] == "continued: second prompt" =>
-            {
+            Some("assistant.delta") if event["payload"]["text"] == "continued: second prompt" => {
                 saw_assistant_delta = true
             }
             Some("turn.cancelled") => saw_cancelled = true,
@@ -192,8 +189,14 @@ fn jsonl_process_supports_runtime_discovery_start_wait_continue_cancel_and_shutd
     }
     assert!(saw_started, "must observe runtime.started notification");
     assert!(saw_continued, "must observe continuation notification");
-    assert!(saw_assistant_delta, "must observe output from the continued turn");
-    assert!(saw_cancelled, "must observe the cancellation terminal event");
+    assert!(
+        saw_assistant_delta,
+        "must observe output from the continued turn"
+    );
+    assert!(
+        saw_cancelled,
+        "must observe the cancellation terminal event"
+    );
 
     bridge.shutdown_and_wait();
 }
