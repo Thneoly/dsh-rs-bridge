@@ -31,6 +31,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build bridge executable for DSH integration test
+        run: cargo build --bin dsh-rs-bridge
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -40,3 +44,8 @@ jobs:
       - name: Type-check DSH adapter
         working-directory: typescript
         run: npm run typecheck
+      - name: Run DSH AgentFactory integration test
+        working-directory: typescript
+        env:
+          DSH_RS_BRIDGE_BIN: ${{ github.workspace }}/target/debug/dsh-rs-bridge
+        run: npm test

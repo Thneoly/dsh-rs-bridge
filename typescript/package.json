@@ -5,7 +5,9 @@
   "type": "module",
   "description": "DSH AgentFactory integration for the Rust runtime bridge",
   "scripts": {
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "build": "tsc --noEmit false --outDir dist",
+    "test": "npm run build && node --test tests/*.test.mjs"
   },
   "dependencies": {
     "@deepseek-ai/cordis": "4.0.5",
