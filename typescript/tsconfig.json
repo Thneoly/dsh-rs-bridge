@@ -6,7 +6,6 @@
     "strict": true,
     "skipLibCheck": true,
     "noEmit": true,
-    "allowImportingTsExtensions": true,
     "esModuleInterop": true,
     "types": ["node"],
     "lib": ["ES2023", "ESNext.Disposable"]
