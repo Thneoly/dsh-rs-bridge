@@ -202,7 +202,7 @@ class RemoteRuntimeAgent implements Agent {
   readonly session: Session
   readonly ctx: Context
   readonly scope: Scope
-  readonly inbox: Inbox
+  readonly inbox: DurableInbox
 
   private readonly carrier: object
   private readonly stored?: StoredSession
@@ -397,10 +397,11 @@ class RemoteRuntimeAgent implements Agent {
         })
       }
 
-      if (this.cancelCause !== undefined) {
+      const cancellationCause = this.getCancelCause()
+      if (cancellationCause !== undefined) {
         await this.bridge.request<RuntimeExecutionSummary>('session.cancel', {
           dsh_session_id: String(this.id),
-          reason: this.cancelCause.kind,
+          reason: cancellationCause.kind,
         })
       }
       const summary = await this.bridge.request<RuntimeExecutionSummary>('session.wait', {
@@ -410,7 +411,7 @@ class RemoteRuntimeAgent implements Agent {
       if (summary.external_session_id !== null) this.externalSessionId = summary.external_session_id
     } catch (error) {
       failureMessage = String(error)
-      terminalStatus = this.cancelCause === undefined ? 'failed' : 'cancelled'
+      terminalStatus = this.getCancelCause() === undefined ? 'failed' : 'cancelled'
     } finally {
       this.bridge.off('runtime-event', onRuntimeEvent)
     }
@@ -440,7 +441,7 @@ class RemoteRuntimeAgent implements Agent {
           turn,
           reason: {
             kind: 'aborted',
-            reason: this.cancelCause ?? { kind: 'user' },
+            reason: this.getCancelCause() ?? { kind: 'user' },
           },
         })
       } else {
@@ -459,6 +460,10 @@ class RemoteRuntimeAgent implements Agent {
     } finally {
       this.currentExecutionActive = false
     }
+  }
+
+  private getCancelCause(): AgentCancelCause | undefined {
+    return this.cancelCause
   }
 
   private async appendUnstoredSuffix(): Promise<void> {
