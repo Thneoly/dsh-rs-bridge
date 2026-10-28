@@ -171,3 +171,22 @@ async fn duplicate_session_start_is_rejected() {
         .await
         .expect("cancel active mock");
 }
+
+#[tokio::test]
+async fn shutdown_interrupts_active_sessions_and_rejects_new_work() {
+    let (supervisor, _, _) = setup(Duration::from_millis(100));
+    supervisor
+        .start(request("session-shutdown"))
+        .await
+        .expect("start");
+    supervisor.shutdown().await.expect("shutdown");
+
+    let finished = supervisor
+        .wait_for_terminal("session-shutdown")
+        .await
+        .expect("terminal after shutdown");
+    assert_eq!(finished.status, RuntimeStatus::Cancelled);
+
+    let result = supervisor.start(request("session-after-shutdown")).await;
+    assert!(matches!(result, Err(RuntimeError::Lifecycle(_))));
+}
