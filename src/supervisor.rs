@@ -121,18 +121,20 @@ impl RuntimeSupervisor {
 
         for (session_id, execution) in active {
             if execution.capabilities.interrupt {
-                if execution.control.interrupt("bridge shutdown").await.is_err() {
+                if execution
+                    .control
+                    .interrupt("bridge shutdown")
+                    .await
+                    .is_err()
+                {
                     let _ = execution.control.close().await;
                 }
             } else {
                 let _ = execution.control.close().await;
             }
 
-            match tokio::time::timeout(
-                Duration::from_secs(3),
-                self.wait_for_terminal(&session_id),
-            )
-            .await
+            match tokio::time::timeout(Duration::from_secs(3), self.wait_for_terminal(&session_id))
+                .await
             {
                 Ok(Ok(_)) => {}
                 Ok(Err(error)) => return Err(error),
@@ -484,7 +486,9 @@ impl RuntimeSupervisor {
     async fn reserve(&self, dsh_session_id: &str) -> Result<(), RuntimeError> {
         let mut reservations = self.inner.reservations.lock().await;
         if self.inner.shutting_down.load(Ordering::SeqCst) {
-            return Err(RuntimeError::Lifecycle("runtime bridge is shutting down".to_owned()));
+            return Err(RuntimeError::Lifecycle(
+                "runtime bridge is shutting down".to_owned(),
+            ));
         }
         if reservations.contains(dsh_session_id) {
             return Err(RuntimeError::Lifecycle(format!(

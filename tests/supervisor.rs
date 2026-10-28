@@ -148,8 +148,13 @@ async fn concurrent_sessions_are_isolated() {
 #[tokio::test]
 async fn one_shot_runtime_rejects_follow_up_input() {
     let (supervisor, _, _) = setup(Duration::from_millis(100));
-    supervisor.start(request("session-send")).await.expect("start");
-    let result = supervisor.send("session-send", "follow-up".to_owned()).await;
+    supervisor
+        .start(request("session-send"))
+        .await
+        .expect("start");
+    let result = supervisor
+        .send("session-send", "follow-up".to_owned())
+        .await;
     assert!(matches!(result, Err(RuntimeError::Capability(_))));
     supervisor
         .interrupt("session-send", "test cleanup")
