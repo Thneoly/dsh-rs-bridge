@@ -22,8 +22,10 @@ test('DSH AgentFactory maps real Rust bridge turns into the DSH Session log', as
   await ctx.plugin(AgentRegistry)
   await ctx.plugin(SessionStore)
 
-  const unregisterTurnBoundary = ctx.sessionProjections.register(turnBoundaryProjectionDefinition)
-  const unregisterInbox = ctx.sessionProjections.register(inboxProjectionDefinition)
+  let unregisterTurnBoundary
+  let unregisterInbox
+  let bridge
+  let factory
   const processConfig = {
     command,
     args: ['--stdio'],
@@ -32,11 +34,20 @@ test('DSH AgentFactory maps real Rust bridge turns into the DSH Session log', as
     requestTimeoutMs: 30000,
     shutdownTimeoutMs: 3000,
   }
-  const bridge = new JsonlBridgeClient(ctx, processConfig)
-  const factory = new BridgeAgentFactory(ctx, bridge, {
-    ...processConfig,
-    runtimeId: 'mock',
+  const pluginFiber = ctx.plugin({
+    name: 'dsh-runtime-bridge-integration-test',
+    inject: ['agents', 'sessions', 'sessionProjections'],
+    apply(pluginCtx) {
+      unregisterTurnBoundary = pluginCtx.sessionProjections.register(turnBoundaryProjectionDefinition)
+      unregisterInbox = pluginCtx.sessionProjections.register(inboxProjectionDefinition)
+      bridge = new JsonlBridgeClient(pluginCtx, processConfig)
+      factory = new BridgeAgentFactory(pluginCtx, bridge, {
+        ...processConfig,
+        runtimeId: 'mock',
+      })
+    },
   })
+  await pluginFiber
   let handle
 
   try {
@@ -67,14 +78,15 @@ test('DSH AgentFactory maps real Rust bridge turns into the DSH Session log', as
     assistantMessages = events.filter(event => event.type === 'assistant/message')
     assert.equal(assistantMessages.length, 2)
     assert.equal(assistantMessages[1].data.message.content[0].text, 'continued: second prompt')
-    assert.equal(ctx.sessionProjections.stateOf(handle.agent.session, 'turnBoundary')?.lastTurn, 2)
-    assert.equal(ctx.agents.get(handle.agent.id), handle.agent)
+    assert.equal(handle.agent.ctx.sessionProjections.stateOf(handle.agent.session, 'turnBoundary')?.lastTurn, 2)
+    assert.equal(handle.agent.ctx.agents.get(handle.agent.id), handle.agent)
   } finally {
     if (handle !== undefined) await handle.dispose()
     await factory.disposeAll()
     await bridge.shutdown()
     unregisterInbox()
     unregisterTurnBoundary()
+    await pluginFiber.dispose()
     await ctx.fiber.dispose()
   }
 })
