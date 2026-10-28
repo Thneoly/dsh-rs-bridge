@@ -392,16 +392,25 @@ impl AcpSession {
 
         let process = self.process.clone();
         let session_id = self.acp_session_id.clone();
+        let params = json!({
+            "sessionId": session_id,
+            "prompt": [{ "type": "text", "text": prompt }]
+        });
+        let (request_id, response_rx) = match process.send_request("session/prompt", params).await {
+            Ok(pending) => pending,
+            Err(error) => {
+                let mut current = process.route.lock().await;
+                if current.as_ref().map(|current| current.turn_id) == Some(route.turn_id) {
+                    *current = None;
+                }
+                return Err(error);
+            }
+        };
+
         let task_route = route.clone();
         tokio::spawn(async move {
             let result = process
-                .request(
-                    "session/prompt",
-                    json!({
-                        "sessionId": session_id,
-                        "prompt": [{ "type": "text", "text": prompt }]
-                    }),
-                )
+                .wait_response(request_id, "session/prompt", response_rx)
                 .await;
 
             match result {
@@ -560,6 +569,15 @@ impl AcpProcess {
     }
 
     async fn request(&self, method: &str, params: Value) -> Result<Value, RuntimeError> {
+        let (id, response_rx) = self.send_request(method, params).await?;
+        self.wait_response(id, method, response_rx).await
+    }
+
+    async fn send_request(
+        &self,
+        method: &str,
+        params: Value,
+    ) -> Result<(u64, oneshot::Receiver<Result<Value, RuntimeError>>), RuntimeError> {
         if self.stopped.load(Ordering::SeqCst) {
             return Err(RuntimeError::Transport(
                 "ACP process has stopped".to_owned(),
@@ -581,13 +599,21 @@ impl AcpProcess {
             self.pending.lock().await.remove(&id);
             return Err(error);
         }
+        Ok((id, rx))
+    }
 
+    async fn wait_response(
+        &self,
+        id: u64,
+        method: &str,
+        response_rx: oneshot::Receiver<Result<Value, RuntimeError>>,
+    ) -> Result<Value, RuntimeError> {
         let limit = if method == "session/prompt" {
             PROMPT_TIMEOUT
         } else {
             REQUEST_TIMEOUT
         };
-        match timeout(limit, rx).await {
+        match timeout(limit, response_rx).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(RuntimeError::Transport(format!(
                 "ACP response channel closed for {method}"

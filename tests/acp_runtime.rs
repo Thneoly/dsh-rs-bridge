@@ -1,9 +1,10 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use dsh_rs_bridge::{
     AcpRuntime, AcpRuntimeConfig, MemoryEventSink, MemorySessionStore, RuntimeStatus,
     RuntimeSupervisor, SessionStore, StartExecutionRequest,
 };
+use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
 fn request(session_id: &str, prompt: &str) -> StartExecutionRequest {
@@ -37,10 +38,13 @@ async fn acp_subprocess_streams_output_continues_and_cancels() {
         .external_session_id
         .clone()
         .expect("external session id");
-    let finished = supervisor
-        .wait_for_terminal("acp-session-1")
-        .await
-        .expect("wait for first turn");
+    let finished = timeout(
+        Duration::from_secs(10),
+        supervisor.wait_for_terminal("acp-session-1"),
+    )
+    .await
+    .expect("first turn timed out")
+    .expect("wait for first turn");
     assert_eq!(finished.status, RuntimeStatus::Completed);
 
     let first_events = events.events_for("acp-session-1").await;
@@ -56,10 +60,13 @@ async fn acp_subprocess_streams_output_continues_and_cancels() {
         .send("acp-session-1", "second prompt".to_owned())
         .await
         .expect("continue existing ACP session");
-    let continued = supervisor
-        .wait_for_terminal("acp-session-1")
-        .await
-        .expect("wait for continuation");
+    let continued = timeout(
+        Duration::from_secs(10),
+        supervisor.wait_for_terminal("acp-session-1"),
+    )
+    .await
+    .expect("continuation timed out")
+    .expect("wait for continuation");
     assert_eq!(continued.status, RuntimeStatus::Completed);
     let record = sessions
         .get("acp-session-1")
@@ -83,10 +90,13 @@ async fn acp_subprocess_streams_output_continues_and_cancels() {
         .start(request("acp-session-cancel", "cancel-me"))
         .await
         .expect("start cancellable ACP session");
-    let cancelled = supervisor
-        .interrupt("acp-session-cancel", "integration test")
-        .await
-        .expect("cancel ACP prompt");
+    let cancelled = timeout(
+        Duration::from_secs(10),
+        supervisor.interrupt("acp-session-cancel", "integration test"),
+    )
+    .await
+    .expect("cancellation timed out")
+    .expect("cancel ACP prompt");
     assert_eq!(cancelled.status, RuntimeStatus::Cancelled);
     assert!(events
         .events_for("acp-session-cancel")
