@@ -13,9 +13,10 @@ use tokio_util::sync::CancellationToken;
 
 use crate::contracts::{
     ExecutionEventEnvelope, ResumeExecutionRequest, RuntimeAdapter, RuntimeCapabilities,
-    RuntimeDescriptor, RuntimeError, RuntimeEvent, RuntimeExecutionSummary, RuntimeHealthStatus,
-    RuntimeResumeRequest, RuntimeSessionControl, RuntimeSessionHandle, RuntimeSessionRecord,
-    RuntimeStartRequest, RuntimeStatus, StartExecutionRequest,
+    RuntimeContinueRequest, RuntimeDescriptor, RuntimeError, RuntimeEvent,
+    RuntimeExecutionSummary, RuntimeHealthStatus, RuntimeResumeRequest, RuntimeSessionControl,
+    RuntimeSessionHandle, RuntimeSessionRecord, RuntimeStartRequest, RuntimeStatus,
+    StartExecutionRequest,
 };
 use crate::store::{ExecutionEventSink, SessionStore};
 
@@ -407,20 +408,166 @@ impl RuntimeSupervisor {
         })
     }
 
+    /// Send input to a live runtime, or start a new turn on the same external session
+    /// after the previous turn has reached a terminal state.
     pub async fn send(&self, dsh_session_id: &str, text: String) -> Result<(), RuntimeError> {
-        let active = self.active_execution(dsh_session_id).await?;
-        if !active.capabilities.continuation {
-            return Err(RuntimeError::Capability(format!(
-                "runtime does not support follow-up input: {dsh_session_id}"
+        match self.active_execution(dsh_session_id).await {
+            Ok(active) => {
+                if !active.capabilities.live_input {
+                    return Err(RuntimeError::Capability(format!(
+                        "runtime does not support input while execution is active: {dsh_session_id}"
+                    )));
+                }
+                return active
+                    .control
+                    .send(crate::contracts::RuntimeSendRequest {
+                        text,
+                        cancellation: CancellationToken::new(),
+                    })
+                    .await;
+            }
+            Err(RuntimeError::NotFound(_)) => {}
+            Err(error) => return Err(error),
+        }
+
+        self.reserve(dsh_session_id).await?;
+        let result = self
+            .continue_reserved(dsh_session_id.to_owned(), text)
+            .await
+            .map(|_| ());
+        self.release_reservation(dsh_session_id).await;
+        result
+    }
+
+    async fn continue_reserved(
+        &self,
+        dsh_session_id: String,
+        prompt: String,
+    ) -> Result<RuntimeExecutionSummary, RuntimeError> {
+        let prompt_length = prompt.chars().count();
+        let mut record = self
+            .inner
+            .sessions
+            .get(&dsh_session_id)
+            .await?
+            .ok_or_else(|| RuntimeError::NotFound(format!("DSH session: {dsh_session_id}")))?;
+        if !record.status.is_terminal() {
+            return Err(RuntimeError::Lifecycle(format!(
+                "cannot continue a non-terminal session: {dsh_session_id}"
             )));
         }
-        active
-            .control
-            .send(crate::contracts::RuntimeSendRequest {
-                text,
-                cancellation: CancellationToken::new(),
+        let external_id = record.external_session_id.clone().ok_or_else(|| {
+            RuntimeError::Lifecycle(format!(
+                "external session reference missing: {dsh_session_id}"
+            ))
+        })?;
+        let adapter = self.require_adapter(&record.runtime_id)?;
+        if !adapter.capabilities().continuation {
+            return Err(RuntimeError::Capability(format!(
+                "runtime {} does not support continuation",
+                adapter.id()
+            )));
+        }
+        let health = adapter.health_check().await;
+        if health.status != RuntimeHealthStatus::Ready {
+            return Err(RuntimeError::Transport(format!(
+                "runtime {} is not ready: {:?}",
+                adapter.id(),
+                health
+            )));
+        }
+
+        let cancellation = CancellationToken::new();
+        record.status = RuntimeStatus::Starting;
+        record.updated_at_ms = now_ms();
+        self.inner.sessions.update(record.clone()).await?;
+
+        let handle = match adapter
+            .continue_session(RuntimeContinueRequest {
+                dsh_session_id: dsh_session_id.clone(),
+                external_session_id: external_id.clone(),
+                prompt,
+                cancellation: cancellation.clone(),
             })
             .await
+        {
+            Ok(handle) => handle,
+            Err(error) => {
+                record.status = if cancellation.is_cancelled() {
+                    RuntimeStatus::Cancelled
+                } else {
+                    RuntimeStatus::Failed
+                };
+                record.updated_at_ms = now_ms();
+                let _ = self.inner.sessions.update(record).await;
+                return Err(error);
+            }
+        };
+        if handle.external_session_id != external_id {
+            let _ = handle.control.close().await;
+            record.status = RuntimeStatus::Failed;
+            record.updated_at_ms = now_ms();
+            let _ = self.inner.sessions.update(record).await;
+            return Err(RuntimeError::Protocol(
+                "adapter changed external session identity during continuation".to_owned(),
+            ));
+        }
+
+        record.status = RuntimeStatus::Running;
+        record.updated_at_ms = now_ms();
+        if let Err(error) = self.inner.sessions.update(record.clone()).await {
+            let _ = handle.control.close().await;
+            return Err(error);
+        }
+        if let Err(error) = self
+            .inner
+            .events
+            .append(envelope(
+                &record,
+                "runtime.continued",
+                None,
+                json!({
+                    "external_session_id": external_id,
+                    "prompt_length": prompt_length
+                }),
+            ))
+            .await
+        {
+            let _ = handle.control.close().await;
+            record.status = RuntimeStatus::Failed;
+            record.updated_at_ms = now_ms();
+            let _ = self.inner.sessions.update(record).await;
+            return Err(error);
+        }
+
+        let RuntimeSessionHandle {
+            events,
+            control,
+            external_session_id: _,
+        } = handle;
+        let (status_tx, _) = watch::channel(RuntimeStatus::Running);
+        let active = Arc::new(ActiveExecution {
+            control: control.clone(),
+            capabilities: adapter.capabilities(),
+            status_tx,
+        });
+        self.inner
+            .active
+            .lock()
+            .await
+            .insert(dsh_session_id.clone(), active.clone());
+
+        let inner = self.inner.clone();
+        tokio::spawn(async move {
+            consume_events(inner, record, events, control, active).await;
+        });
+
+        Ok(RuntimeExecutionSummary {
+            dsh_session_id,
+            runtime_id: adapter.id().to_owned(),
+            external_session_id: Some(external_id),
+            status: RuntimeStatus::Running,
+        })
     }
 
     pub async fn interrupt(
@@ -589,7 +736,7 @@ async fn consume_events(
         record.status = RuntimeStatus::Failed;
         record.updated_at_ms = now_ms();
         let _ = inner.sessions.update(record.clone()).await;
-        active.status_tx.send_replace(RuntimeStatus::Failed);
+        final_status = RuntimeStatus::Failed;
     } else {
         let _ = inner
             .events
@@ -600,7 +747,6 @@ async fn consume_events(
                 json!({ "status": final_status }),
             ))
             .await;
-        active.status_tx.send_replace(final_status);
     }
 
     if let Err(error) = control.close().await {
@@ -615,7 +761,10 @@ async fn consume_events(
             .await;
     }
 
+    // Remove the attachment before notifying waiters. A follow-up request that
+    // observes a terminal status can then safely reserve this session again.
     inner.active.lock().await.remove(&record.dsh_session_id);
+    active.status_tx.send_replace(final_status);
 }
 
 fn envelope(

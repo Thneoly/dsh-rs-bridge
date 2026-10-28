@@ -82,6 +82,9 @@ pub struct RuntimeCapabilities {
     pub streaming_events: bool,
     pub resume: bool,
     pub interrupt: bool,
+    /// Accept steering/follow-up input while an execution is still active.
+    pub live_input: bool,
+    /// Start another turn in the same external session after the previous turn ended.
     pub continuation: bool,
 }
 
@@ -128,6 +131,15 @@ pub struct RuntimeSendRequest {
     pub cancellation: CancellationToken,
 }
 
+#[derive(Debug, Clone)]
+pub struct RuntimeContinueRequest {
+    pub dsh_session_id: String,
+    /// Runtime-owned identity of the existing conversation.
+    pub external_session_id: String,
+    pub prompt: String,
+    pub cancellation: CancellationToken,
+}
+
 pub struct RuntimeSessionHandle {
     pub external_session_id: String,
     pub events: mpsc::Receiver<RuntimeEvent>,
@@ -158,6 +170,16 @@ pub trait RuntimeAdapter: Send + Sync {
     ) -> Result<RuntimeSessionHandle, RuntimeError> {
         Err(RuntimeError::Capability(format!(
             "runtime {} does not implement resume",
+            self.id()
+        )))
+    }
+
+    async fn continue_session(
+        &self,
+        _request: RuntimeContinueRequest,
+    ) -> Result<RuntimeSessionHandle, RuntimeError> {
+        Err(RuntimeError::Capability(format!(
+            "runtime {} does not support continuation",
             self.id()
         )))
     }
