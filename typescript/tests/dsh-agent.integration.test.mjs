@@ -188,7 +188,10 @@ test('DSH AgentFactory restores persisted ACP conversation after bridge restart'
     assert.equal(assistantMessages.length, 1)
     assert.equal(assistantMessages[0].data.message.content[0].text, 'ACP says: before restart')
 
-    await firstHandle.dispose()
+    await firstHandle.dispose().catch(error => {
+      console.error('[resume integration] dispose causes:', error?.errors ?? error)
+      throw error
+    })
     firstHandle = undefined
     await factory.disposeAll()
     factory = undefined
