@@ -11,6 +11,81 @@ fn respond(stdout: &mut impl Write, id: Value, result: Value) {
     send(stdout, json!({"jsonrpc":"2.0","id":id,"result":result}));
 }
 
+fn session_update(stdout: &mut impl Write, session_id: &str, update: Value) {
+    send(
+        stdout,
+        json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": { "sessionId": session_id, "update": update }
+        }),
+    );
+}
+
+fn chunk(stdout: &mut impl Write, session_id: &str, text: &str) {
+    session_update(
+        stdout,
+        session_id,
+        json!({
+            "sessionUpdate": "agent_message_chunk",
+            "content": { "type": "text", "text": text }
+        }),
+    );
+}
+
+/// Continue a "needs-permission" turn once the client's outcome arrived:
+/// an allowed tool call emits the full tool lifecycle; a rejection denies; a
+/// cancelled outcome aborts the turn like a spec-conformant agent would.
+fn finish_permission_turn(
+    stdout: &mut impl Write,
+    session_id: &str,
+    prompt_id: Value,
+    outcome: Option<&str>,
+) {
+    if matches!(outcome, Some("cancelled")) {
+        respond(stdout, prompt_id, json!({"stopReason": "cancelled"}));
+        return;
+    }
+    let allowed = matches!(outcome, Some("allow_once") | Some("allow_always"));
+    if allowed {
+        session_update(
+            stdout,
+            session_id,
+            json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "fixture-tool-1",
+                "title": "read marker file",
+                "kind": "read",
+                "status": "in_progress",
+                "content": []
+            }),
+        );
+        session_update(
+            stdout,
+            session_id,
+            json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "fixture-tool-1",
+                "title": "read marker file",
+                "kind": "read",
+                "status": "completed",
+                "content": [{ "type": "text", "text": "marker: FIXTURE-MARKER-42" }]
+            }),
+        );
+        chunk(stdout, session_id, "tool ran: FIXTURE-MARKER-42");
+    } else {
+        chunk(
+            stdout,
+            session_id,
+            &format!(
+                "permission denied (outcome: {})",
+                outcome.unwrap_or("cancelled")
+            ),
+        );
+    }
+    respond(stdout, prompt_id, json!({"stopReason": "end_turn"}));
+}
+
 fn main() {
     let stdin = io::stdin();
     let mut stdout = io::stdout().lock();
@@ -20,6 +95,10 @@ fn main() {
     // Set while the stashed prompt belongs to the "ignore-cancel" scenario:
     // session/cancel is then deliberately ignored to model a stuck agent.
     let mut ignore_next_cancel = false;
+    // Set after sending session/request_permission: the prompt request id to
+    // answer once the client's outcome arrives on a later stdin line.
+    let mut awaiting_permission: Option<Value> = None;
+    let mut permission_outcome: Option<String> = None;
 
     for line in stdin.lock().lines() {
         let line = match line {
@@ -30,6 +109,31 @@ fn main() {
             Ok(m) => m,
             Err(_) => continue,
         };
+        // Responses to requests we sent (the permission outcome).
+        if message.get("method").is_none() {
+            if let Some(outcome) = message.get("result").and_then(|r| r.get("outcome")) {
+                permission_outcome = outcome
+                    .get("optionId")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .or_else(|| {
+                        outcome
+                            .get("outcome")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned)
+                    });
+            }
+            if let Some(prompt_id) = awaiting_permission.take() {
+                finish_permission_turn(
+                    &mut stdout,
+                    &session_id,
+                    prompt_id,
+                    permission_outcome.as_deref(),
+                );
+                permission_outcome = None;
+            }
+            continue;
+        }
         let method = message.get("method").and_then(Value::as_str).unwrap_or("");
         let id = message.get("id").cloned();
 
@@ -99,6 +203,33 @@ fn main() {
                 }
                 if prompt == "cancel-me" {
                     pending_prompt = Some(id);
+                    continue;
+                }
+                if prompt == "needs-permission" {
+                    // Ask the client whether the tool may run; the turn
+                    // continues when the outcome arrives on a later line.
+                    send(
+                        &mut stdout,
+                        json!({
+                            "jsonrpc": "2.0",
+                            "id": "perm-1",
+                            "method": "session/request_permission",
+                            "params": {
+                                "sessionId": session_id.clone(),
+                                "toolCall": {
+                                    "toolCallId": "fixture-tool-1",
+                                    "title": "read marker file",
+                                    "kind": "read",
+                                    "status": "in_progress"
+                                },
+                                "options": [
+                                    { "optionId": "allow_once", "name": "Allow", "kind": "allow_once" },
+                                    { "optionId": "reject_once", "name": "Deny", "kind": "reject_once" }
+                                ]
+                            }
+                        }),
+                    );
+                    awaiting_permission = Some(id);
                     continue;
                 }
                 if prompt == "crash" {

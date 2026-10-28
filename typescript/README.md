@@ -22,9 +22,19 @@ Example configuration:
     runtimeId: mock
     requestTimeoutMs: 30000
     shutdownTimeoutMs: 3000
+    permissionPolicy: deny
+    turnTimeoutMs: 3600000
 ```
 
 For a local development build, use `command: cargo` and `args: ["run", "--release", "--", "--stdio"]`, with `cwd` set to the Rust repository root.
+
+`turnTimeoutMs` is the per-turn budget for `session.wait`/`session.cancel` —
+kept separate from the short `requestTimeoutMs` so real-model turns that
+stream for minutes are not failed spuriously. `permissionPolicy` decides how
+forwarded runtime permission requests are answered automatically (`deny` is
+the safe default); DSH exposes no interactive host channel to the Agent yet,
+so both the question and the automatic answer are also surfaced as transient
+`agent/runtime-event` notifications for audit and a future permission UI.
 
 Per-agent engine selection is available through the merge-extensible DSH `AgentOptions` field `runtimeId`. The selected ID must be registered by the Rust bridge's `runtime.list` / `runtime.probe`.
 

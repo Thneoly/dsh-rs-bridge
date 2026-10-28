@@ -41,6 +41,10 @@ pub enum RuntimeEventType {
     TurnFailed,
     #[serde(rename = "runtime.status")]
     RuntimeStatus,
+    #[serde(rename = "permission.requested")]
+    PermissionRequested,
+    #[serde(rename = "permission.responded")]
+    PermissionResponded,
 }
 
 impl RuntimeEventType {
@@ -54,6 +58,8 @@ impl RuntimeEventType {
             Self::TurnCancelled => "turn.cancelled",
             Self::TurnFailed => "turn.failed",
             Self::RuntimeStatus => "runtime.status",
+            Self::PermissionRequested => "permission.requested",
+            Self::PermissionResponded => "permission.responded",
         }
     }
 
@@ -89,6 +95,9 @@ pub struct RuntimeCapabilities {
     pub live_input: bool,
     /// Start another turn in the same external session after the previous turn ended.
     pub continuation: bool,
+    /// Forward runtime permission requests to the host instead of deciding
+    /// locally. When false the adapter answers permission requests itself.
+    pub permission_requests: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -153,6 +162,17 @@ pub struct RuntimeContinueRequest {
     pub cancellation: CancellationToken,
 }
 
+/// A host decision for a previously forwarded `permission.requested` event.
+#[derive(Debug, Clone)]
+pub struct RuntimePermissionResponse {
+    pub dsh_session_id: String,
+    pub external_session_id: String,
+    /// Identifier from the `permission.requested` payload.
+    pub permission_request_id: String,
+    /// The chosen runtime option id from the request's options list.
+    pub option_id: String,
+}
+
 pub struct RuntimeSessionHandle {
     pub external_session_id: String,
     pub events: mpsc::Receiver<RuntimeEvent>,
@@ -201,6 +221,18 @@ pub trait RuntimeAdapter: Send + Sync {
     ) -> Result<RuntimeSessionHandle, RuntimeError> {
         Err(RuntimeError::Capability(format!(
             "runtime {} does not support continuation",
+            self.id()
+        )))
+    }
+
+    /// Deliver a host decision for a forwarded permission request. Only
+    /// meaningful for adapters that advertise `permission_requests`.
+    async fn respond_permission(
+        &self,
+        _request: RuntimePermissionResponse,
+    ) -> Result<(), RuntimeError> {
+        Err(RuntimeError::Capability(format!(
+            "runtime {} does not forward permission requests",
             self.id()
         )))
     }

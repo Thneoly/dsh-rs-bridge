@@ -49,8 +49,17 @@ declare module '@deepseek-ai/dsh-agent' {
   }
 }
 
+/** How the DSH side answers runtime permission requests it cannot surface
+ * interactively yet (DSH exposes no host round-trip channel to the Agent). */
+export type PermissionPolicy = 'deny' | 'allow'
+
 export interface RuntimeBridgeFactoryConfig extends BridgeProcessConfig {
   runtimeId: string
+  permissionPolicy: PermissionPolicy
+  /** Budget for one external turn (session.wait), separate from the short
+   * request timeout: real-model turns routinely exceed the default 30s RPC
+   * budget and must not be failed spuriously. */
+  turnTimeoutMs: number
 }
 
 interface StoredSession {
@@ -224,6 +233,8 @@ class RemoteRuntimeAgent implements Agent {
     options: AgentOptions,
     private readonly runtimeId: string,
     private readonly bridge: JsonlBridgeClient,
+    private readonly permissionPolicy: PermissionPolicy,
+    private readonly turnTimeoutMs: number,
     stored?: StoredSession,
     externalSessionId?: string,
   ) {
@@ -286,7 +297,7 @@ class RemoteRuntimeAgent implements Agent {
       void this.bridge.request<RuntimeExecutionSummary>('session.cancel', {
         dsh_session_id: String(this.id),
         reason: cause.kind,
-      }).catch(error => {
+      }, this.turnTimeoutMs).catch(error => {
         this.hostCtx.logger.warn('runtime cancellation failed for session ' + String(this.id) + ': ' + String(error))
       })
     }
@@ -332,6 +343,49 @@ class RemoteRuntimeAgent implements Agent {
         if (!this.disposed && (this.inbox.nextTurn.length > 0 || this.inbox.nextStep.length > 0)) this.wake()
       })
     this.turnTask = tracked
+  }
+
+  /** Pick an option per the configured permission policy and deliver it.
+   * When no option matches the policy (e.g. deny with only allow options),
+   * stay silent: the bridge auto-denies after its own bounded deadline. */
+  private async answerPermission(payload: Record<string, unknown>): Promise<void> {
+    const requestId = typeof payload.request_id === 'string' ? payload.request_id : undefined
+    if (requestId === undefined) {
+      this.hostCtx.logger.warn('permission request without request_id for session ' + String(this.id))
+      return
+    }
+    const options = Array.isArray(payload.options) ? payload.options : []
+    const optionIdOf = (option: unknown): string | undefined => {
+      const record = option as Record<string, unknown> | undefined
+      const value = record?.optionId ?? record?.option_id
+      return typeof value === 'string' ? value : undefined
+    }
+    const kindOf = (option: unknown): string => {
+      const record = option as Record<string, unknown> | undefined
+      return typeof record?.kind === 'string' ? record.kind : ''
+    }
+    const wanted = this.permissionPolicy === 'allow' ? 'allow' : 'reject'
+    const chosen = options.find(option => kindOf(option).startsWith(wanted))
+      ?? (this.permissionPolicy === 'allow' ? options[0] : undefined)
+    const optionId = chosen === undefined ? undefined : optionIdOf(chosen)
+    if (optionId === undefined) {
+      this.hostCtx.logger.warn(
+        'permission policy ' + this.permissionPolicy + ' matched no option for session ' + String(this.id)
+          + '; letting the bridge deadline decide',
+      )
+      return
+    }
+    try {
+      await this.bridge.request<{ delivered: boolean }>('permission.respond', {
+        dsh_session_id: String(this.id),
+        request_id: requestId,
+        option_id: optionId,
+      })
+    } catch (error) {
+      this.hostCtx.logger.warn(
+        'permission response failed for session ' + String(this.id) + ': ' + String(error),
+      )
+    }
   }
 
   private setStatus(status: AgentStatus): void {
@@ -425,6 +479,37 @@ class RemoteRuntimeAgent implements Agent {
             at_unix_ms: event.at_unix_ms,
           },
         })
+      } else if (event.event_type === 'permission.requested') {
+        // The bridge forwarded the runtime's permission question. DSH exposes
+        // no interactive host channel to the Agent yet, so answer per the
+        // configured policy and keep an audit trace; a future DSH permission
+        // UI can replace the automatic answer.
+        this.notify('agent/runtime-event', {
+          turn,
+          step,
+          event: {
+            runtime_id: event.runtime_id,
+            external_session_id: event.external_session_id,
+            event_type: event.event_type,
+            ...(event.runtime_seq === undefined ? {} : { runtime_seq: event.runtime_seq }),
+            payload: event.payload,
+            at_unix_ms: event.at_unix_ms,
+          },
+        })
+        void this.answerPermission(event.payload)
+      } else if (event.event_type === 'permission.responded') {
+        this.notify('agent/runtime-event', {
+          turn,
+          step,
+          event: {
+            runtime_id: event.runtime_id,
+            external_session_id: event.external_session_id,
+            event_type: event.event_type,
+            ...(event.runtime_seq === undefined ? {} : { runtime_seq: event.runtime_seq }),
+            payload: event.payload,
+            at_unix_ms: event.at_unix_ms,
+          },
+        })
       } else if (event.event_type === 'turn.failed' || event.event_type === 'runtime.failed') {
         failureMessage = typeof event.payload.message === 'string'
           ? event.payload.message
@@ -458,11 +543,11 @@ class RemoteRuntimeAgent implements Agent {
         await this.bridge.request<RuntimeExecutionSummary>('session.cancel', {
           dsh_session_id: String(this.id),
           reason: cancellationCause.kind,
-        })
+        }, this.turnTimeoutMs)
       }
       const summary = await this.bridge.request<RuntimeExecutionSummary>('session.wait', {
         dsh_session_id: String(this.id),
-      })
+      }, this.turnTimeoutMs)
       terminalStatus = summary.status
       if (summary.external_session_id !== null) this.externalSessionId = summary.external_session_id
     } catch (error) {
@@ -615,7 +700,7 @@ export class BridgeAgentFactory implements AgentFactory {
     let stored: StoredSession | undefined
     try {
       stored = await raceAbort(this.createStoredSession(session, options.signal), options.signal, 'session persistence create cancelled')
-      const agent = new RemoteRuntimeAgent(this.ctx, session, options.agentOptions ?? {}, runtimeId, this.bridge, stored)
+      const agent = new RemoteRuntimeAgent(this.ctx, session, options.agentOptions ?? {}, runtimeId, this.bridge, this.config.permissionPolicy, this.config.turnTimeoutMs, stored)
       let detachSession: (() => void) | undefined
       let detachAgent: (() => void) | undefined
       let teardownPromise: Promise<void> | undefined
@@ -779,6 +864,8 @@ export class BridgeAgentFactory implements AgentFactory {
         options.agentOptions ?? {},
         restored.runtime_id,
         this.bridge,
+        this.config.permissionPolicy,
+        this.config.turnTimeoutMs,
         stored,
         restored.external_session_id,
       )

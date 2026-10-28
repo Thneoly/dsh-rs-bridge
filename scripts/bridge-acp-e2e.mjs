@@ -6,6 +6,8 @@
 // Phases (one DSH session, one continuous external conversation):
 //   A  first turn: streamed assistant.delta strictly before turn.completed, terminal completed
 //   B  same-session recall turn: the model must echo a codeword planted in turn 1
+//   T  tool turn: the agent must read a marker file; if it asks permission,
+//      the gate answers allow and asserts the permission + tool round-trip
 //   C  mid-stream cancellation: cancel after the first streamed delta -> turn.cancelled
 //   D  durable journal: sessions.jsonl replay matches the observed terminal states
 //   E  bridge restart + session.restore + another codeword recall on the SAME external session
@@ -46,6 +48,7 @@ if (!command) {
 const rpcTimeoutMs = numenv('DSH_RS_BRIDGE_GATE_RPC_TIMEOUT_MS', 20000)
 const turnTimeoutMs = numenv('DSH_RS_BRIDGE_GATE_TURN_TIMEOUT_MS', 300000)
 const cancelProbeTimeoutMs = numenv('DSH_RS_BRIDGE_GATE_CANCEL_PROBE_TIMEOUT_MS', 30000)
+const permissionProbeTimeoutMs = numenv('DSH_RS_BRIDGE_GATE_PERMISSION_PROBE_TIMEOUT_MS', 45000)
 const cancelAttempts = Number(process.env.DSH_RS_BRIDGE_GATE_CANCEL_ATTEMPTS ?? 3)
 if (!Number.isInteger(cancelAttempts) || cancelAttempts < 1) throw new Error('Invalid DSH_RS_BRIDGE_GATE_CANCEL_ATTEMPTS')
 const keepArtifacts = process.env.DSH_RS_BRIDGE_GATE_KEEP === '1'
@@ -55,6 +58,9 @@ const codeWord = ('XLY-' + randomUUID().slice(0, 8)).toUpperCase()
 const temp = mkdtempSync(join(tmpdir(), 'dsh-real-acp-gate-'))
 const stateDir = join(temp, 'state')
 const sessionId = 'real-acp-gate-' + process.pid
+// The marker file is only obtainable by actually running a tool in the
+// session cwd; its content reuses the codeword token.
+writeFileSync(join(temp, 'gate-tool.txt'), `tool-marker-${codeWord}\n`)
 
 const report = {
   startedAt: new Date().toISOString(),
@@ -355,6 +361,59 @@ async function main() {
     'the model did not recall the codeword planted in turn 1 (same-session memory broken)',
   )
   phase('B same-session recall', 'codeword recalled on the same external session', startedAt)
+
+  // Phase T: tool use behind a permission round-trip. The model can only
+  // produce the marker by reading gate-tool.txt in the session cwd.
+  startedAt = Date.now()
+  await bridge.request('session.send', {
+    dsh_session_id: sessionId,
+    text: 'Use a shell command to print the contents of the file named gate-tool.txt in the current working directory, then reply with the exact command output and nothing else.',
+  })
+  const toolFromIndex = bridge.sessionEvents(sessionId).length
+  const toolTrigger = await waitForSessionEvent(
+    bridge,
+    sessionId,
+    toolFromIndex,
+    event => event.event_type === 'permission.requested' || turnTerminal(event),
+    permissionProbeTimeoutMs,
+    'permission.requested or terminal event of the tool turn',
+  )
+  let answeredPermission = false
+  if (toolTrigger.event_type === 'permission.requested') {
+    const options = toolTrigger.payload?.options ?? []
+    const allow = options.find(option => String(option.kind ?? '').startsWith('allow')) ?? options[0]
+    assert.ok(allow?.optionId, 'permission request offered no options')
+    await bridge.request('permission.respond', {
+      dsh_session_id: sessionId,
+      request_id: toolTrigger.payload?.request_id,
+      option_id: allow.optionId,
+    })
+    answeredPermission = true
+  }
+  const toolTerminal = await bridge.request('session.wait', { dsh_session_id: sessionId }, turnTimeoutMs)
+  assert.equal(toolTerminal.status, 'completed', 'tool turn did not complete')
+  assert.equal(toolTerminal.external_session_id, externalSessionId, 'tool turn changed external session identity')
+  const toolWindows = turnWindows(bridge.sessionEvents(sessionId))
+  const toolWindow = toolWindows[toolWindows.length - 1] ?? []
+  const toolText = windowText(toolWindow).toUpperCase()
+  assert.ok(
+    toolText.includes(codeWord),
+    'the model did not echo the marker file content (tool round-trip broken)',
+  )
+  if (answeredPermission) {
+    assert.ok(
+      toolWindow.some(event => event.event_type === 'permission.responded' && event.payload?.source === 'host'),
+      'host permission decision must be reported as permission.responded',
+    )
+    assert.ok(
+      toolWindow.some(event => event.event_type === 'tool.started' || event.event_type === 'tool.completed'),
+      'an allowed permission must surface tool lifecycle events',
+    )
+    phase('T tool + permission', 'permission asked and answered allow; marker read via tool', startedAt)
+  } else {
+    console.log('[conversation-gate] note: the agent read the marker without asking for permission')
+    phase('T tool', 'marker read via tool without a permission prompt', startedAt)
+  }
 
   // Phase C: cancel a live turn after the first streamed delta.
   startedAt = Date.now()

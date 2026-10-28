@@ -45,6 +45,8 @@ export interface RuntimeDescriptor {
     interrupt: boolean
     live_input: boolean
     continuation: boolean
+    /** Adapters that forward permission requests set this; older bridges omit it. */
+    permission_requests?: boolean
   }
   health: {
     status: 'ready' | 'degraded' | 'unavailable'
@@ -97,7 +99,7 @@ export class JsonlBridgeClient extends EventEmitter {
     })
   }
 
-  request<T>(method: string, params: Record<string, unknown> = {}): Promise<T> {
+  request<T>(method: string, params: Record<string, unknown> = {}, timeoutMs?: number): Promise<T> {
     if (this.child.killed || this.child.stdin.destroyed || !this.child.stdin.writable) {
       return Promise.reject(new Error('dsh-rs-bridge stdin is not writable'))
     }
@@ -114,7 +116,7 @@ export class JsonlBridgeClient extends EventEmitter {
       const timeout = setTimeout(() => {
         this.pending.delete(id)
         reject(new Error('dsh-rs-bridge request timed out: ' + method))
-      }, this.config.requestTimeoutMs)
+      }, timeoutMs ?? this.config.requestTimeoutMs)
       this.pending.set(id, {
         resolve: value => resolve(value as T),
         reject,
