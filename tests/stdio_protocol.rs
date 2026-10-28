@@ -12,7 +12,7 @@ static NEXT_STATE_DIR: AtomicU64 = AtomicU64::new(1);
 struct BridgeProcess {
     child: Child,
     state_dir: PathBuf,
-    stdin: ChildStdin,
+    stdin: Option<ChildStdin>,
     stdout: BufReader<ChildStdout>,
     notifications: Vec<Value>,
 }
@@ -40,7 +40,7 @@ impl BridgeProcess {
         Self {
             child,
             state_dir,
-            stdin,
+            stdin: Some(stdin),
             stdout,
             notifications: Vec::new(),
         }
@@ -53,9 +53,10 @@ impl BridgeProcess {
             "method": method,
             "params": params,
         });
-        serde_json::to_writer(&mut self.stdin, &request).expect("serialize request");
-        self.stdin.write_all(b"\n").expect("write request newline");
-        self.stdin.flush().expect("flush request");
+        let stdin = self.stdin.as_mut().expect("bridge stdin");
+        serde_json::to_writer(&mut *stdin, &request).expect("serialize request");
+        stdin.write_all(b"\n").expect("write request newline");
+        stdin.flush().expect("flush request");
     }
 
     fn response(&mut self, id: &str) -> Value {
@@ -86,7 +87,7 @@ impl BridgeProcess {
         self.send("shutdown", "bridge.shutdown", json!({}));
         let response = self.response("shutdown");
         assert_eq!(response["result"]["stopping"], true);
-        drop(self.stdin);
+        self.stdin.take();
         let status = self.child.wait().expect("wait for bridge process");
         assert!(status.success(), "bridge process exited with {status}");
     }
