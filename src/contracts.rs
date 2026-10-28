@@ -183,6 +183,11 @@ pub trait RuntimeAdapter: Send + Sync {
             self.id()
         )))
     }
+
+    /// Stop adapter-owned resources after active executions have drained.
+    async fn shutdown(&self) -> Result<(), RuntimeError> {
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

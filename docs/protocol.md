@@ -38,3 +38,21 @@ The host_seq value is monotonic per DSH session and is assigned by the bridge. T
 - Continuation reuses the same external session ID but starts a new runtime attachment; active in-flight input is a separate capability (live_input).
 - The protocol is request/notification JSONL, not a complete JSON-RPC 2.0 implementation.
 - ACP and vendor-specific CLI adapters are not implemented yet.
+
+
+## ACP adapter
+
+The bridge can optionally register an ACP v1 subprocess adapter. Configure it
+with `DSH_RS_BRIDGE_ACP_COMMAND`; `DSH_RS_BRIDGE_ACP_ARGS` is a JSON array,
+`DSH_RS_BRIDGE_ACP_CWD` selects a default working directory, and
+`DSH_RS_BRIDGE_ACP_ENV` is a JSON object of environment overrides.
+
+The adapter performs `initialize`, `session/new`, and `session/prompt`.
+ACP `session/update` notifications are translated into runtime events:
+assistant chunks/messages, tool-call updates, and status updates. Cancellation
+is forwarded using `session/cancel`. A completed turn can continue on the same
+ACP session while the bridge process remains alive.
+
+The adapter currently reports `resume: false`: session IDs are retained only
+in memory, and the bridge cannot safely restore the external process binding
+after a restart. It does not advertise live input during an active prompt.

@@ -42,3 +42,18 @@ Supported methods:
 - bridge.shutdown
 
 The protocol is a project-local initial contract, not an existing DSH or ACP standard.
+
+
+## ACP v1 subprocess adapter
+
+The optional `AcpRuntime` launches one ACP agent process per external ACP
+session. It negotiates protocol version 1, creates a session, sends prompts,
+and translates `session/update` notifications into the bridge's runtime event
+contract. The ACP process and ACP session ID are distinct from the DSH session
+identity. Subsequent prompts reuse the same ACP process/session until bridge
+shutdown, preserving in-process conversation continuity.
+
+The adapter's session control sends ACP cancellation notifications. The
+supervisor drains active turns first and then invokes each adapter's shutdown
+hook to release adapter-owned subprocesses. Resume is intentionally disabled
+until durable external-session binding and restart recovery are implemented.
