@@ -6,8 +6,9 @@ use tokio::sync::{mpsc, Mutex};
 
 use crate::contracts::{
     RuntimeAdapter, RuntimeCapabilities, RuntimeError, RuntimeEvent, RuntimeEventType,
-    RuntimeHealth, RuntimeHealthStatus, RuntimeResumeRequest, RuntimeSendRequest,
-    RuntimeSessionControl, RuntimeSessionHandle, RuntimeStartRequest, RuntimeStatus,
+    RuntimeContinueRequest, RuntimeHealth, RuntimeHealthStatus, RuntimeResumeRequest,
+    RuntimeSendRequest, RuntimeSessionControl, RuntimeSessionHandle, RuntimeStartRequest,
+    RuntimeStatus,
 };
 
 #[derive(Clone)]
@@ -15,6 +16,7 @@ pub struct MockRuntime {
     id: String,
     output: String,
     delay: Duration,
+    continuation: bool,
 }
 
 impl MockRuntime {
@@ -23,6 +25,7 @@ impl MockRuntime {
             id: id.into(),
             output: "mock runtime completed the task".to_owned(),
             delay: Duration::from_millis(5),
+            continuation: false,
         }
     }
 
@@ -36,12 +39,18 @@ impl MockRuntime {
         self
     }
 
+    pub fn with_continuation(mut self, enabled: bool) -> Self {
+        self.continuation = enabled;
+        self
+    }
+
     fn capabilities_value(&self) -> RuntimeCapabilities {
         RuntimeCapabilities {
             streaming_events: true,
             resume: true,
             interrupt: true,
-            continuation: false,
+            live_input: false,
+            continuation: self.continuation,
         }
     }
 
@@ -142,6 +151,28 @@ impl RuntimeAdapter for MockRuntime {
             self.output.clone(),
             self.delay,
             true,
+        ))
+    }
+
+    async fn continue_session(
+        &self,
+        request: RuntimeContinueRequest,
+    ) -> Result<RuntimeSessionHandle, RuntimeError> {
+        if request.cancellation.is_cancelled() {
+            return Err(RuntimeError::Lifecycle(
+                "continuation cancelled before mock runtime launch".to_owned(),
+            ));
+        }
+        if !self.continuation {
+            return Err(RuntimeError::Capability(
+                "mock runtime does not support continuation".to_owned(),
+            ));
+        }
+        Ok(self.spawn_turn(
+            request.external_session_id,
+            format!("continued: {}", request.prompt),
+            self.delay,
+            false,
         ))
     }
 }

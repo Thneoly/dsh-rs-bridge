@@ -6,8 +6,9 @@ use dsh_rs_bridge::{
 };
 use tokio_util::sync::CancellationToken;
 
-fn setup(
+fn setup_with_continuation(
     delay: Duration,
+    continuation: bool,
 ) -> (
     RuntimeSupervisor,
     Arc<MemorySessionStore>,
@@ -20,10 +21,21 @@ fn setup(
         .register(Arc::new(
             MockRuntime::new("mock")
                 .with_output("hello from mock")
-                .with_delay(delay),
+                .with_delay(delay)
+                .with_continuation(continuation),
         ))
         .expect("register mock runtime");
     (supervisor, sessions, events)
+}
+
+fn setup(
+    delay: Duration,
+) -> (
+    RuntimeSupervisor,
+    Arc<MemorySessionStore>,
+    Arc<MemoryEventSink>,
+) {
+    setup_with_continuation(delay, false)
 }
 
 fn request(session_id: &str) -> StartExecutionRequest {
@@ -143,6 +155,46 @@ async fn concurrent_sessions_are_isolated() {
         .await
         .iter()
         .all(|e| e.event.dsh_session_id == "session-b"));
+}
+
+#[tokio::test]
+async fn continuation_starts_a_new_turn_with_the_same_external_session() {
+    let (supervisor, sessions, events) =
+        setup_with_continuation(Duration::from_millis(1), true);
+    let first = supervisor
+        .start(request("session-continue"))
+        .await
+        .expect("start");
+    supervisor
+        .wait_for_terminal("session-continue")
+        .await
+        .expect("first terminal");
+
+    supervisor
+        .send("session-continue", "second prompt".to_owned())
+        .await
+        .expect("continue session");
+    let second = supervisor
+        .wait_for_terminal("session-continue")
+        .await
+        .expect("second terminal");
+
+    assert_eq!(second.status, RuntimeStatus::Completed);
+    assert_eq!(first.external_session_id, second.external_session_id);
+    let record = sessions
+        .get("session-continue")
+        .await
+        .expect("store")
+        .expect("record");
+    assert_eq!(record.status, RuntimeStatus::Completed);
+    let stream = events.events_for("session-continue").await;
+    assert!(stream
+        .iter()
+        .any(|item| item.event.event_type == "runtime.continued"));
+    assert!(stream.iter().any(|item| {
+        item.event.event_type == "assistant.delta"
+            && item.event.payload["text"] == "continued: second prompt"
+    }));
 }
 
 #[tokio::test]

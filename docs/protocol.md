@@ -28,12 +28,13 @@ The host_seq value is monotonic per DSH session and is assigned by the bridge. T
 - session.resume: reattach to the external session referenced by a DSH session.
 - session.cancel: interrupt an active execution and wait for its terminal state.
 - session.wait: wait until the session reaches a terminal state.
-- session.send: send follow-up input if the runtime advertises continuation.
+- session.send: send input to an active runtime if it advertises live_input; after a terminal turn, start a continuation on the same external session if continuation is supported.
 - bridge.shutdown: stop reading requests and exit.
 
 ## Current limitations
 
 - Only the deterministic mock runtime is registered by the initial server.
 - Session bindings are in memory and are lost when the process exits.
+- Continuation reuses the same external session ID but starts a new runtime attachment; active in-flight input is a separate capability (live_input).
 - The protocol is request/notification JSONL, not a complete JSON-RPC 2.0 implementation.
 - ACP and vendor-specific CLI adapters are not implemented yet.

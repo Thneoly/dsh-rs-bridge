@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use dsh_rs_bridge::{
     ExecutionEventEnvelope, ExecutionEventSink, MemorySessionStore, MockRuntime,
@@ -226,7 +226,15 @@ async fn run_stdio() -> Result<(), RuntimeError> {
     let event_sink = Arc::new(JsonlEventSink::new(writer.clone()));
     let sessions = Arc::new(MemorySessionStore::default());
     let supervisor = RuntimeSupervisor::new(sessions, event_sink);
-    supervisor.register(Arc::new(MockRuntime::new("mock")))?;
+    let delay_ms = std::env::var("DSH_RS_BRIDGE_MOCK_DELAY_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(5);
+    supervisor.register(Arc::new(
+        MockRuntime::new("mock")
+            .with_continuation(true)
+            .with_delay(Duration::from_millis(delay_ms)),
+    ))?;
 
     let stdin = tokio::io::stdin();
     let mut lines = BufReader::new(stdin).lines();

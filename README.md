@@ -12,6 +12,8 @@ This is not a rewrite of DSH and does not confuse a model API provider with a fu
 
 Milestone 0: Rust contract, supervisor, deterministic Mock Runtime, versioned stdio JSONL server, and CI.
 
+In progress: real-process JSONL integration tests and multi-turn continuation semantics.
+
 Not implemented yet: ACP adapter, durable storage, and the TypeScript DSH Core integration.
 
 ## Requirements
