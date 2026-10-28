@@ -1,7 +1,40 @@
 # dsh-rs-bridge
 
-Rust-based runtime bridge prototype for DSH, grounded in the pinned DSH baseline `dsh-v0.2.1-rc.3` (`1f81c047fc48fa190a683e469daa699857e9afe8`).
+Rust runtime bridge prototype for DSH, grounded in the pinned DSH source baseline dsh-v0.2.1-rc.3 (1f81c047fc48fa190a683e469daa699857e9afe8).
 
-The first milestone defines a runtime contract, lifecycle supervisor, and deterministic mock runtime. It does not modify DSH core; integration will be validated through a thin TypeScript bridge after the Rust contract is tested.
+## Goal
 
-Status: bootstrap in progress.
+Keep DSH's TypeScript Native AgentLoop intact while making external Agent Runtimes first-class execution backends. The bridge owns the runtime contract, adapter registry, lifecycle supervision, external session binding, and event notifications. A thin TypeScript adapter will eventually map the bridge protocol to the exact DSH Agent and Session contracts.
+
+This is not a rewrite of DSH and does not confuse a model API provider with a full Agent Runtime.
+
+## Current status
+
+Milestone 0: Rust contract, supervisor, deterministic Mock Runtime, versioned stdio JSONL server, and CI.
+
+Not implemented yet: ACP adapter, durable storage, and the TypeScript DSH Core integration.
+
+## Requirements
+
+- Rust stable toolchain
+- Cargo
+
+## Build and test
+
+    cargo fmt --all -- --check
+    cargo test --all-targets
+    cargo clippy --all-targets -- -D warnings
+
+## Run
+
+Probe the protocol and build version:
+
+    cargo run -- --probe
+
+Start the stdio JSONL server:
+
+    cargo run -- --stdio
+
+The server emits JSONL only on stdout. Keep logs and diagnostics on stderr.
+
+See docs/architecture.md, docs/protocol.md, and docs/dsh-baseline.md.
