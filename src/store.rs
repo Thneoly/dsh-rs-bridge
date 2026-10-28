@@ -10,7 +10,8 @@ use crate::contracts::{
 #[async_trait]
 pub trait SessionStore: Send + Sync {
     async fn create(&self, record: RuntimeSessionRecord) -> Result<(), RuntimeError>;
-    async fn get(&self, dsh_session_id: &str) -> Result<Option<RuntimeSessionRecord>, RuntimeError>;
+    async fn get(&self, dsh_session_id: &str)
+        -> Result<Option<RuntimeSessionRecord>, RuntimeError>;
     async fn update(&self, record: RuntimeSessionRecord) -> Result<(), RuntimeError>;
 }
 
@@ -39,7 +40,10 @@ impl SessionStore for MemorySessionStore {
         Ok(())
     }
 
-    async fn get(&self, dsh_session_id: &str) -> Result<Option<RuntimeSessionRecord>, RuntimeError> {
+    async fn get(
+        &self,
+        dsh_session_id: &str,
+    ) -> Result<Option<RuntimeSessionRecord>, RuntimeError> {
         Ok(self.records.lock().await.get(dsh_session_id).cloned())
     }
 
@@ -88,10 +92,15 @@ impl MemoryEventSink {
 impl ExecutionEventSink for MemoryEventSink {
     async fn append(&self, event: ExecutionEventEnvelope) -> Result<u64, RuntimeError> {
         let mut state = self.state.lock().await;
-        let sequence = state.sequences.entry(event.dsh_session_id.clone()).or_insert(0);
+        let sequence = state
+            .sequences
+            .entry(event.dsh_session_id.clone())
+            .or_insert(0);
         *sequence += 1;
         let host_seq = *sequence;
-        state.events.push(PersistedExecutionEvent { host_seq, event });
+        state
+            .events
+            .push(PersistedExecutionEvent { host_seq, event });
         Ok(host_seq)
     }
 }

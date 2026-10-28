@@ -36,10 +36,7 @@ pub struct RuntimeSupervisor {
 }
 
 impl RuntimeSupervisor {
-    pub fn new(
-        sessions: Arc<dyn SessionStore>,
-        events: Arc<dyn ExecutionEventSink>,
-    ) -> Self {
+    pub fn new(sessions: Arc<dyn SessionStore>, events: Arc<dyn ExecutionEventSink>) -> Self {
         Self {
             inner: Arc::new(SupervisorInner {
                 adapters: RwLock::new(HashMap::new()),
@@ -63,11 +60,10 @@ impl RuntimeSupervisor {
                 "runtime adapter must support streaming events: {id}"
             )));
         }
-        let mut adapters = self
-            .inner
-            .adapters
-            .write()
-            .map_err(|_| RuntimeError::Lifecycle("runtime registry lock poisoned".to_owned()))?;
+        let mut adapters =
+            self.inner.adapters.write().map_err(|_| {
+                RuntimeError::Lifecycle("runtime registry lock poisoned".to_owned())
+            })?;
         if adapters.contains_key(id) {
             return Err(RuntimeError::Configuration(format!(
                 "runtime adapter already registered: {id}"
@@ -162,7 +158,10 @@ impl RuntimeSupervisor {
 
         let external_session_id = handle.external_session_id.clone();
         if request.cancellation.is_cancelled() {
-            let _ = handle.control.interrupt("start cancelled during launch").await;
+            let _ = handle
+                .control
+                .interrupt("start cancelled during launch")
+                .await;
             let _ = handle.control.close().await;
             record.status = RuntimeStatus::Cancelled;
             record.external_session_id = Some(external_session_id);
@@ -390,13 +389,7 @@ impl RuntimeSupervisor {
         &self,
         dsh_session_id: &str,
     ) -> Result<RuntimeExecutionSummary, RuntimeError> {
-        let active = self
-            .inner
-            .active
-            .lock()
-            .await
-            .get(dsh_session_id)
-            .cloned();
+        let active = self.inner.active.lock().await.get(dsh_session_id).cloned();
         if let Some(active) = active {
             let mut receiver = active.status_tx.subscribe();
             loop {
@@ -423,7 +416,10 @@ impl RuntimeSupervisor {
         Ok(summary(&record))
     }
 
-    async fn active_execution(&self, dsh_session_id: &str) -> Result<Arc<ActiveExecution>, RuntimeError> {
+    async fn active_execution(
+        &self,
+        dsh_session_id: &str,
+    ) -> Result<Arc<ActiveExecution>, RuntimeError> {
         self.inner
             .active
             .lock()
@@ -460,7 +456,9 @@ impl RuntimeSupervisor {
             .map_err(|_| RuntimeError::Lifecycle("runtime registry lock poisoned".to_owned()))?
             .get(id)
             .cloned()
-            .ok_or_else(|| RuntimeError::Configuration(format!("runtime adapter not registered: {id}")))
+            .ok_or_else(|| {
+                RuntimeError::Configuration(format!("runtime adapter not registered: {id}"))
+            })
     }
 }
 

@@ -125,12 +125,7 @@ impl RuntimeAdapter for MockRuntime {
             ));
         }
         let external_session_id = format!("{}::{}", self.id, request.dsh_session_id);
-        Ok(self.spawn_turn(
-            external_session_id,
-            self.output.clone(),
-            self.delay,
-            false,
-        ))
+        Ok(self.spawn_turn(external_session_id, self.output.clone(), self.delay, false))
     }
 
     async fn resume(
