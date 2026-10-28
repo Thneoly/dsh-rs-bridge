@@ -62,3 +62,24 @@ When enabled, the adapter appears as runtime ID `acp`; use that ID in
 Continuation uses the same in-process ACP session. Resume after bridge restart
 is intentionally not advertised yet because external session bindings are not
 durable. The bridge terminates ACP subprocesses during orderly shutdown.
+
+
+## Real ACP smoke test
+
+CI includes a real-process handshake against the OpenCode 2.2.0 ACP server.
+The test launches the official Linux binary and verifies ACP v1 initialization,
+protocol negotiation, and `session/new`. It intentionally does not submit a
+prompt, so it requires no model provider credentials and incurs no inference
+cost. The deterministic fixture-agent tests still cover streamed output,
+continuation, cancellation, and shutdown.
+
+You can run the same probe locally with any installed ACP agent:
+
+```sh
+DSH_RS_BRIDGE_ACP_SMOKE_COMMAND=opencode \
+DSH_RS_BRIDGE_ACP_SMOKE_ARGS='["acp"]' \
+node scripts/acp-smoke.mjs
+```
+
+Override the command and JSON-array arguments for another ACP agent. The probe
+does not print environment variables or authentication material.
