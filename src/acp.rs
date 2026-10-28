@@ -34,6 +34,7 @@ const ACP_PROTOCOL_VERSION: u64 = 1;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 const PROMPT_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
+const STDIN_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 static NEXT_EXTERNAL_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Debug)]
@@ -43,6 +44,8 @@ pub struct AcpRuntimeConfig {
     pub args: Vec<String>,
     pub cwd: Option<PathBuf>,
     pub env: HashMap<String, String>,
+    pub prompt_timeout: Duration,
+    pub stdin_write_timeout: Duration,
 }
 
 impl AcpRuntimeConfig {
@@ -53,6 +56,8 @@ impl AcpRuntimeConfig {
             args: Vec::new(),
             cwd: None,
             env: HashMap::new(),
+            prompt_timeout: PROMPT_TIMEOUT,
+            stdin_write_timeout: STDIN_WRITE_TIMEOUT,
         }
     }
 
@@ -75,6 +80,25 @@ impl AcpRuntimeConfig {
         self.env = env;
         self
     }
+
+    /// Override how long a `session/prompt` response may take. Once the limit
+    /// is hit the agent process is killed: ACP cannot attribute late
+    /// session/update notifications to an abandoned turn, so the only safe
+    /// state after a prompt timeout is a fresh process reattached via
+    /// `session.restore`.
+    pub fn with_prompt_timeout(mut self, prompt_timeout: Duration) -> Self {
+        self.prompt_timeout = prompt_timeout;
+        self
+    }
+
+    /// Override how long a stdin write may block before the agent is declared
+    /// wedged and killed. A child that stops draining its stdin must not hold
+    /// the write mutex (and through it the turn lock and every later request,
+    /// including session/cancel) indefinitely.
+    pub fn with_stdin_write_timeout(mut self, stdin_write_timeout: Duration) -> Self {
+        self.stdin_write_timeout = stdin_write_timeout;
+        self
+    }
 }
 
 pub struct AcpRuntime {
@@ -88,6 +112,12 @@ impl AcpRuntime {
             config,
             sessions: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Number of attached external sessions. Observability hook for hosts and
+    /// tests: a completed shutdown must drain this to zero.
+    pub async fn session_count(&self) -> usize {
+        self.sessions.lock().await.len()
     }
 
     fn ensure_configured(&self) -> Result<(), RuntimeError> {
@@ -665,6 +695,8 @@ struct AcpProcess {
     route: Mutex<Option<Arc<TurnRoute>>>,
     next_request_id: AtomicU64,
     stopped: AtomicBool,
+    prompt_timeout: Duration,
+    stdin_write_timeout: Duration,
 }
 
 impl AcpProcess {
@@ -700,6 +732,8 @@ impl AcpProcess {
             route: Mutex::new(None),
             next_request_id: AtomicU64::new(1),
             stopped: AtomicBool::new(false),
+            prompt_timeout: config.prompt_timeout,
+            stdin_write_timeout: config.stdin_write_timeout,
         });
         let weak = Arc::downgrade(&process);
         tokio::spawn(async move {
@@ -749,7 +783,7 @@ impl AcpProcess {
         response_rx: oneshot::Receiver<Result<Value, RuntimeError>>,
     ) -> Result<Value, RuntimeError> {
         let limit = match method {
-            "session/prompt" => PROMPT_TIMEOUT,
+            "session/prompt" => self.prompt_timeout,
             "session/load" => Duration::from_secs(120),
             _ => REQUEST_TIMEOUT,
         };
@@ -760,6 +794,16 @@ impl AcpProcess {
             ))),
             Err(_) => {
                 self.pending.lock().await.remove(&id);
+                if method == "session/prompt" {
+                    // The abandoned agent may keep streaming session/update
+                    // notifications that the protocol cannot attribute to a
+                    // turn; the only safe state is a fresh process, later
+                    // reattached through session.restore.
+                    self.stop_with_reason(
+                        "session/prompt timed out; abandoning the turn to protect turn isolation",
+                    )
+                    .await;
+                }
                 Err(RuntimeError::Transport(format!(
                     "ACP request timed out: {method}"
                 )))
@@ -780,18 +824,39 @@ impl AcpProcess {
         let mut line = serde_json::to_vec(&message)
             .map_err(|error| RuntimeError::Protocol(error.to_string()))?;
         line.push(b'\n');
-        let mut stdin = self.stdin.lock().await;
-        let writer = stdin
-            .as_mut()
-            .ok_or_else(|| RuntimeError::Transport("ACP child stdin is closed".to_owned()))?;
-        writer
-            .write_all(&line)
-            .await
-            .map_err(|error| RuntimeError::Transport(format!("write ACP request: {error}")))?;
-        writer
-            .flush()
-            .await
-            .map_err(|error| RuntimeError::Transport(format!("flush ACP request: {error}")))
+        let mut timed_out = false;
+        {
+            let mut stdin = self.stdin.lock().await;
+            let writer = stdin
+                .as_mut()
+                .ok_or_else(|| RuntimeError::Transport("ACP child stdin is closed".to_owned()))?;
+            // A child that stops draining its stdin must not wedge the write
+            // mutex (and through it the turn lock and every later request,
+            // including session/cancel) forever.
+            let written = async {
+                writer.write_all(&line).await.map_err(|error| {
+                    RuntimeError::Transport(format!("write ACP request: {error}"))
+                })?;
+                writer
+                    .flush()
+                    .await
+                    .map_err(|error| RuntimeError::Transport(format!("flush ACP request: {error}")))
+            };
+            match timeout(self.stdin_write_timeout, written).await {
+                Ok(result) => result?,
+                Err(_) => timed_out = true,
+            }
+        }
+        if timed_out {
+            // Release the stdin guard before killing the wedged child.
+            self.stop_with_reason("ACP stdin write timed out; killing the wedged agent")
+                .await;
+            return Err(RuntimeError::Transport(format!(
+                "ACP stdin write timed out after {}ms; the agent stopped draining stdin",
+                self.stdin_write_timeout.as_millis()
+            )));
+        }
+        Ok(())
     }
 
     async fn read_loop(weak: Weak<Self>, stdout: ChildStdout) {
@@ -802,10 +867,11 @@ impl AcpProcess {
                 Ok(None) => break,
                 Err(error) => {
                     if let Some(process) = weak.upgrade() {
+                        // A read error means the stream (and effectively the
+                        // agent) is gone: mark the process dead so pending
+                        // requests fail and session.restore can replace it.
                         process
-                            .fail_pending(RuntimeError::Transport(format!(
-                                "read ACP stdout: {error}"
-                            )))
+                            .stop_with_reason(&format!("failed reading ACP stdout: {error}"))
                             .await;
                     }
                     return;
@@ -832,10 +898,11 @@ impl AcpProcess {
 
         if let Some(process) = weak.upgrade() {
             if !process.stopped.load(Ordering::SeqCst) {
+                // The agent closed stdout: it is dead or unusable. Marking it
+                // stopped (instead of only failing pending requests) is what
+                // lets session.restore replace the zombie entry later.
                 process
-                    .fail_pending(RuntimeError::Transport(
-                        "ACP agent closed stdout unexpectedly".to_owned(),
-                    ))
+                    .stop_with_reason("ACP agent closed stdout unexpectedly")
                     .await;
             }
         }
@@ -969,6 +1036,15 @@ impl AcpProcess {
     }
 
     async fn stop(&self) {
+        self.stop_with_reason("ACP process stopped").await
+    }
+
+    /// Idempotently mark this agent process dead: close stdin, kill and reap
+    /// the child, and fail every pending request with `reason`. The first
+    /// caller wins; later calls are no-ops. Used both for orderly shutdown and
+    /// for spontaneous death (stdout EOF, read errors, wedged stdin) so that
+    /// `session.restore` can always replace a dead session entry.
+    async fn stop_with_reason(&self, reason: &str) {
         if self.stopped.swap(true, Ordering::SeqCst) {
             return;
         }
@@ -976,7 +1052,8 @@ impl AcpProcess {
         let mut child = self.child.lock().await;
         let _ = child.start_kill();
         let _ = timeout(SHUTDOWN_TIMEOUT, child.wait()).await;
-        self.fail_pending(RuntimeError::Transport("ACP process stopped".to_owned()))
+        drop(child);
+        self.fail_pending(RuntimeError::Transport(reason.to_owned()))
             .await;
     }
 }

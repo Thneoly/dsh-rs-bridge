@@ -120,6 +120,305 @@ async fn acp_subprocess_streams_output_continues_and_cancels() {
 
 static NEXT_STORE_PATH: AtomicU64 = AtomicU64::new(1);
 
+fn acp_supervisor(
+    sessions: Arc<MemorySessionStore>,
+    events: Arc<MemoryEventSink>,
+) -> RuntimeSupervisor {
+    let supervisor = RuntimeSupervisor::new(sessions, events);
+    let config = AcpRuntimeConfig::new(env!("CARGO_BIN_EXE_acp-test-agent"))
+        .with_id("acp-test")
+        .with_env(HashMap::new());
+    supervisor
+        .register(Arc::new(AcpRuntime::new(config)))
+        .expect("register ACP runtime");
+    supervisor
+}
+
+async fn wait_for_terminal_status(
+    supervisor: &RuntimeSupervisor,
+    session_id: &str,
+) -> dsh_rs_bridge::RuntimeExecutionSummary {
+    timeout(
+        Duration::from_secs(10),
+        supervisor.wait_for_terminal(session_id),
+    )
+    .await
+    .expect("terminal state timed out")
+    .expect("wait for terminal state")
+}
+
+async fn eventually_delta(events: &Arc<MemoryEventSink>, session_id: &str, text: &str) -> bool {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let observed = events.events_for(session_id).await.iter().any(|item| {
+            item.event.event_type == "assistant.delta"
+                && item.event.payload["text"].as_str() == Some(text)
+        });
+        if observed {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test]
+async fn acp_agent_death_mid_turn_fails_and_restore_reattaches() {
+    let sessions = Arc::new(MemorySessionStore::default());
+    let events = Arc::new(MemoryEventSink::default());
+    let supervisor = acp_supervisor(sessions.clone(), events.clone());
+
+    let started = supervisor
+        .start(request("acp-crash-session", "crash"))
+        .await
+        .expect("start session that will crash");
+    let external_id = started
+        .external_session_id
+        .clone()
+        .expect("external session id");
+
+    let finished = wait_for_terminal_status(&supervisor, "acp-crash-session").await;
+    assert_eq!(finished.status, RuntimeStatus::Failed);
+    let stream = events.events_for("acp-crash-session").await;
+    let failure = stream
+        .iter()
+        .find(|item| item.event.event_type == "turn.failed")
+        .expect("agent death must surface as turn.failed");
+    assert!(
+        !failure.event.payload["message"]
+            .as_str()
+            .unwrap_or_default()
+            .is_empty(),
+        "turn.failed must carry the death cause"
+    );
+
+    // The dead session entry must be replaceable: restore spawns a fresh
+    // agent process bound to the same external conversation.
+    let restored = supervisor
+        .restore_session("acp-crash-session")
+        .await
+        .expect("restore after agent death");
+    assert_eq!(
+        restored.external_session_id.as_deref(),
+        Some(external_id.as_str())
+    );
+
+    supervisor
+        .send("acp-crash-session", "after crash".to_owned())
+        .await
+        .expect("continue restored conversation");
+    let continued = wait_for_terminal_status(&supervisor, "acp-crash-session").await;
+    assert_eq!(continued.status, RuntimeStatus::Completed);
+    assert_eq!(
+        continued.external_session_id.as_deref(),
+        Some(external_id.as_str())
+    );
+    assert!(
+        eventually_delta(&events, "acp-crash-session", "ACP says: after crash").await,
+        "restored conversation must stream new output"
+    );
+
+    supervisor
+        .shutdown()
+        .await
+        .expect("shutdown after recovery");
+}
+
+#[tokio::test]
+async fn acp_malformed_line_fails_inflight_turn_and_session_stays_usable() {
+    let sessions = Arc::new(MemorySessionStore::default());
+    let events = Arc::new(MemoryEventSink::default());
+    let supervisor = acp_supervisor(sessions, events.clone());
+
+    supervisor
+        .start(request("acp-garbage-session", "garbage"))
+        .await
+        .expect("start session that emits a corrupt line");
+
+    let finished = wait_for_terminal_status(&supervisor, "acp-garbage-session").await;
+    assert_eq!(finished.status, RuntimeStatus::Failed);
+    assert!(events
+        .events_for("acp-garbage-session")
+        .await
+        .iter()
+        .any(|item| item.event.event_type == "turn.failed"));
+
+    // The process itself is still healthy: the next turn on the same session
+    // must complete normally.
+    supervisor
+        .send("acp-garbage-session", "still alive".to_owned())
+        .await
+        .expect("continue after corrupt line");
+    let continued = wait_for_terminal_status(&supervisor, "acp-garbage-session").await;
+    assert_eq!(continued.status, RuntimeStatus::Completed);
+    assert!(
+        eventually_delta(&events, "acp-garbage-session", "ACP says: still alive").await,
+        "session must remain usable after a corrupt line"
+    );
+
+    supervisor.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn acp_prompt_timeout_kills_agent_and_restore_recovers() {
+    let sessions = Arc::new(MemorySessionStore::default());
+    let events = Arc::new(MemoryEventSink::default());
+    let supervisor = RuntimeSupervisor::new(sessions, events);
+    let config = AcpRuntimeConfig::new(env!("CARGO_BIN_EXE_acp-test-agent"))
+        .with_id("acp-test")
+        .with_env(HashMap::new())
+        .with_prompt_timeout(Duration::from_millis(500));
+    supervisor
+        .register(Arc::new(AcpRuntime::new(config)))
+        .expect("register ACP runtime");
+
+    supervisor
+        .start(request("acp-timeout-session", "ignore-cancel"))
+        .await
+        .expect("start session whose prompt never answers");
+
+    let finished = wait_for_terminal_status(&supervisor, "acp-timeout-session").await;
+    assert_eq!(finished.status, RuntimeStatus::Failed);
+
+    // The timed-out agent must be KILLED, not merely abandoned: ACP cannot
+    // attribute its late session/update notifications to a turn, so a live
+    // orphan would contaminate the next turn's event stream. A prompt without
+    // a preceding restore must therefore hit the dead-process guard.
+    let refused = supervisor
+        .send("acp-timeout-session", "probe".to_owned())
+        .await;
+    assert!(
+        matches!(&refused, Err(dsh_rs_bridge::RuntimeError::Transport(message))
+            if message.contains("no longer running")),
+        "prompt after timeout kill must be refused, got: {refused:?}"
+    );
+
+    let restored = supervisor
+        .restore_session("acp-timeout-session")
+        .await
+        .expect("restore after prompt timeout");
+    assert!(restored.external_session_id.is_some());
+    supervisor
+        .send("acp-timeout-session", "after timeout".to_owned())
+        .await
+        .expect("continue restored conversation");
+    let continued = wait_for_terminal_status(&supervisor, "acp-timeout-session").await;
+    assert_eq!(continued.status, RuntimeStatus::Completed);
+
+    supervisor
+        .shutdown()
+        .await
+        .expect("shutdown after timeout kill");
+}
+
+#[tokio::test]
+async fn acp_stdin_wedge_write_times_out_and_kills_agent() {
+    let sessions = Arc::new(MemorySessionStore::default());
+    let events = Arc::new(MemoryEventSink::default());
+    let supervisor = RuntimeSupervisor::new(sessions, events);
+    let config = AcpRuntimeConfig::new(env!("CARGO_BIN_EXE_acp-test-agent"))
+        .with_id("acp-test")
+        .with_env(HashMap::new())
+        .with_stdin_write_timeout(Duration::from_millis(500));
+    supervisor
+        .register(Arc::new(AcpRuntime::new(config)))
+        .expect("register ACP runtime");
+
+    // First turn completes; the agent then stops draining stdin forever.
+    supervisor
+        .start(request("acp-wedge-session", "wedge-now"))
+        .await
+        .expect("start session that will wedge");
+    let finished = wait_for_terminal_status(&supervisor, "acp-wedge-session").await;
+    assert_eq!(finished.status, RuntimeStatus::Completed);
+
+    // A prompt larger than any pipe buffer cannot be written to the wedged
+    // agent: the bounded write must fail the request and kill the child
+    // instead of holding the stdin mutex (and the turn lock) forever.
+    let oversized = "x".repeat(256 * 1024);
+    let wedged = timeout(
+        Duration::from_secs(10),
+        supervisor.send("acp-wedge-session", oversized),
+    )
+    .await
+    .expect("wedged write must be bounded")
+    .expect_err("wedged write must fail");
+    assert!(
+        wedged.to_string().contains("stdin write timed out"),
+        "unexpected wedge error: {wedged}"
+    );
+
+    // The wedged agent is dead now: a restore must replace it and the same
+    // session must work again.
+    supervisor
+        .restore_session("acp-wedge-session")
+        .await
+        .expect("restore after stdin wedge");
+    supervisor
+        .send("acp-wedge-session", "after wedge".to_owned())
+        .await
+        .expect("continue after stdin wedge");
+    let continued = wait_for_terminal_status(&supervisor, "acp-wedge-session").await;
+    assert_eq!(continued.status, RuntimeStatus::Completed);
+
+    supervisor.shutdown().await.expect("shutdown after wedge");
+}
+
+#[tokio::test]
+async fn interrupt_is_bounded_when_agent_ignores_cancellation() {
+    let sessions = Arc::new(MemorySessionStore::default());
+    let events = Arc::new(MemoryEventSink::default());
+    let supervisor = RuntimeSupervisor::with_interrupt_timeout(
+        sessions,
+        events.clone(),
+        Duration::from_millis(500),
+    );
+    let config = AcpRuntimeConfig::new(env!("CARGO_BIN_EXE_acp-test-agent"))
+        .with_id("acp-test")
+        .with_env(HashMap::new());
+    let runtime = Arc::new(AcpRuntime::new(config));
+    supervisor
+        .register(runtime.clone())
+        .expect("register ACP runtime");
+
+    supervisor
+        .start(request("acp-stuck-session", "ignore-cancel"))
+        .await
+        .expect("start stuck session");
+    assert!(
+        eventually_delta(&events, "acp-stuck-session", "ACP is stuck").await,
+        "stuck agent must stream its first chunk"
+    );
+
+    // An agent that ignores session/cancel must not hold the host hostage.
+    let interrupted = timeout(
+        Duration::from_secs(5),
+        supervisor.interrupt("acp-stuck-session", "test"),
+    )
+    .await
+    .expect("interrupt must be bounded");
+    assert!(
+        interrupted.is_err(),
+        "unsettled cancel must surface an error"
+    );
+
+    // Shutdown must still run the adapter cleanup hooks (draining the
+    // adapter's session map and killing the stuck agent) even though the
+    // session never converges; the failure is reported afterwards.
+    let shutdown = supervisor.shutdown().await;
+    assert!(
+        shutdown.is_err(),
+        "a never-settling session must be reported, not silently dropped"
+    );
+    assert_eq!(
+        runtime.session_count().await,
+        0,
+        "adapter shutdown hooks must drain every session even when one is stuck"
+    );
+}
+
 fn persistent_store_path() -> PathBuf {
     std::env::temp_dir()
         .join(format!(
