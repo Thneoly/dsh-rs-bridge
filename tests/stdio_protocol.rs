@@ -48,7 +48,10 @@ impl BridgeProcess {
     fn response(&mut self, id: &str) -> Value {
         loop {
             let mut line = String::new();
-            let count = self.stdout.read_line(&mut line).expect("read bridge stdout");
+            let count = self
+                .stdout
+                .read_line(&mut line)
+                .expect("read bridge stdout");
             assert_ne!(count, 0, "bridge exited before response id={id}");
 
             let message: Value = serde_json::from_str(&line)
