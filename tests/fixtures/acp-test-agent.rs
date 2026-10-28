@@ -17,6 +17,9 @@ fn main() {
     let mut session_id = String::new();
     let mut next_session = 0_u64;
     let mut pending_prompt: Option<Value> = None;
+    // Set while the stashed prompt belongs to the "ignore-cancel" scenario:
+    // session/cancel is then deliberately ignored to model a stuck agent.
+    let mut ignore_next_cancel = false;
 
     for line in stdin.lock().lines() {
         let line = match line {
@@ -98,6 +101,61 @@ fn main() {
                     pending_prompt = Some(id);
                     continue;
                 }
+                if prompt == "crash" {
+                    // Die mid-turn without answering the prompt.
+                    send(
+                        &mut stdout,
+                        json!({
+                            "jsonrpc": "2.0",
+                            "method": "session/update",
+                            "params": {
+                                "sessionId": session_id.clone(),
+                                "update": {
+                                    "sessionUpdate": "agent_message_chunk",
+                                    "content": {"type": "text", "text": "ACP is about to crash"}
+                                }
+                            }
+                        }),
+                    );
+                    let _ = stdout.flush();
+                    std::process::exit(1);
+                }
+                if prompt == "garbage" {
+                    // Emit a corrupt stdout line mid-turn, then behave
+                    // normally so the session stays usable afterwards.
+                    let _ = stdout.write_all(b"this line is not json\n");
+                    let _ = stdout.flush();
+                }
+                if prompt == "wedge-now" {
+                    // Answer this turn, then stop draining stdin forever:
+                    // an agent whose pipe the host can no longer write to.
+                    respond(&mut stdout, id, json!({"stopReason":"end_turn"}));
+                    let _ = stdout.flush();
+                    loop {
+                        std::thread::sleep(std::time::Duration::from_secs(1));
+                    }
+                }
+                if prompt == "ignore-cancel" {
+                    // Stream one chunk, then never answer the prompt and
+                    // ignore session/cancel: a stuck agent.
+                    pending_prompt = Some(id);
+                    ignore_next_cancel = true;
+                    send(
+                        &mut stdout,
+                        json!({
+                            "jsonrpc": "2.0",
+                            "method": "session/update",
+                            "params": {
+                                "sessionId": session_id.clone(),
+                                "update": {
+                                    "sessionUpdate": "agent_message_chunk",
+                                    "content": {"type": "text", "text": "ACP is stuck"}
+                                }
+                            }
+                        }),
+                    );
+                    continue;
+                }
                 send(
                     &mut stdout,
                     json!({
@@ -118,6 +176,9 @@ fn main() {
                 respond(&mut stdout, id, json!({"stopReason":"end_turn"}));
             }
             "session/cancel" => {
+                if ignore_next_cancel {
+                    continue;
+                }
                 if let Some(id) = pending_prompt.take() {
                     respond(&mut stdout, id, json!({"stopReason":"cancelled"}));
                 }

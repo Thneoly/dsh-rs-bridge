@@ -33,7 +33,13 @@ struct SupervisorInner {
     active: Mutex<HashMap<String, Arc<ActiveExecution>>>,
     reservations: Mutex<HashSet<String>>,
     shutting_down: AtomicBool,
+    interrupt_timeout: Duration,
 }
+
+/// How long `session.cancel` waits for a terminal state before giving up.
+/// An agent that ignores `session/cancel` must not hold the host hostage for
+/// the full prompt budget.
+const DEFAULT_INTERRUPT_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 pub struct RuntimeSupervisor {
@@ -42,6 +48,17 @@ pub struct RuntimeSupervisor {
 
 impl RuntimeSupervisor {
     pub fn new(sessions: Arc<dyn SessionStore>, events: Arc<dyn ExecutionEventSink>) -> Self {
+        Self::with_interrupt_timeout(sessions, events, DEFAULT_INTERRUPT_TIMEOUT)
+    }
+
+    /// Alternate constructor that overrides the `session.cancel` terminal-state
+    /// deadline (exposed for tests; the default is
+    /// [`DEFAULT_INTERRUPT_TIMEOUT`]).
+    pub fn with_interrupt_timeout(
+        sessions: Arc<dyn SessionStore>,
+        events: Arc<dyn ExecutionEventSink>,
+        interrupt_timeout: Duration,
+    ) -> Self {
         Self {
             inner: Arc::new(SupervisorInner {
                 adapters: RwLock::new(HashMap::new()),
@@ -50,6 +67,7 @@ impl RuntimeSupervisor {
                 active: Mutex::new(HashMap::new()),
                 reservations: Mutex::new(HashSet::new()),
                 shutting_down: AtomicBool::new(false),
+                interrupt_timeout,
             }),
         }
     }
@@ -120,6 +138,11 @@ impl RuntimeSupervisor {
             .map(|(session_id, execution)| (session_id.clone(), execution.clone()))
             .collect();
 
+        // Drain every active session even when one refuses to converge: a
+        // stuck session must not skip the adapter shutdown hooks below, or
+        // adapter-owned subprocesses would leak. The first error is returned
+        // after cleanup completes.
+        let mut first_error = None;
         for (session_id, execution) in active {
             if execution.capabilities.interrupt {
                 if execution
@@ -138,11 +161,17 @@ impl RuntimeSupervisor {
                 .await
             {
                 Ok(Ok(_)) => {}
-                Ok(Err(error)) => return Err(error),
+                Ok(Err(error)) => {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
                 Err(_) => {
-                    return Err(RuntimeError::Transport(format!(
-                        "timed out shutting down runtime session: {session_id}"
-                    )));
+                    if first_error.is_none() {
+                        first_error = Some(RuntimeError::Transport(format!(
+                            "timed out shutting down runtime session: {session_id}"
+                        )));
+                    }
                 }
             }
         }
@@ -163,7 +192,7 @@ impl RuntimeSupervisor {
                 }
             }
         }
-        if let Some(error) = shutdown_error {
+        if let Some(error) = first_error.or(shutdown_error) {
             return Err(error);
         }
         Ok(())
@@ -711,7 +740,20 @@ impl RuntimeSupervisor {
             }
             active.control.interrupt(reason).await?;
         }
-        self.wait_for_terminal(dsh_session_id).await
+        // An agent that ignores session/cancel must not hold the host until
+        // the prompt budget expires; report the unsettled state instead.
+        match tokio::time::timeout(
+            self.inner.interrupt_timeout,
+            self.wait_for_terminal(dsh_session_id),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(RuntimeError::Transport(format!(
+                "runtime did not reach a terminal state within {}ms after interrupt: {dsh_session_id}",
+                self.inner.interrupt_timeout.as_millis()
+            ))),
+        }
     }
 
     pub async fn wait_for_terminal(

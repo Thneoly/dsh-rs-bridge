@@ -60,10 +60,21 @@ shutdown, preserving in-process conversation continuity.
 
 The adapter's session control sends ACP cancellation notifications. The
 supervisor drains active turns first and then invokes each adapter's shutdown
-hook to release adapter-owned subprocesses. The in-place resume RPC stays
-disabled by design; restart recovery goes through `session.restore`, which
-reattaches the persisted binding instead of claiming to resume an interrupted
-in-flight turn.
+hook to release adapter-owned subprocesses — a session that refuses to
+converge is reported as an error but does not skip the adapter cleanup. The
+in-place resume RPC stays disabled by design; restart recovery goes through
+`session.restore`, which reattaches the persisted binding instead of claiming
+to resume an interrupted in-flight turn.
+
+Exception recovery: agent-process death mid-turn settles the turn as failed
+and marks the process dead, so `session.restore` transparently replaces the
+zombie with a fresh agent bound to the same external conversation. Prompt
+timeouts kill the process rather than orphaning it, because ACP
+`session/update` carries no turn identity and an abandoned agent's late
+updates would otherwise contaminate the next turn's event stream. Stdin
+writes are deadline-bounded so a wedged agent cannot hold the turn lock, and
+`session.cancel` gives up after a bounded wait instead of blocking until the
+prompt budget expires.
 
 
 ## DSH live event projection

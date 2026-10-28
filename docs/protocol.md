@@ -84,6 +84,18 @@ fresh agent process and reattaches the persisted external conversation via
 without resume support). It does not advertise live input during an active
 prompt.
 
+Failure containment: if the agent process dies mid-turn (stdout closed or
+unreadable), pending requests fail, the turn settles on `turn.failed`, and the
+dead process is marked stopped so the next `session.restore` replaces it. A
+`session/prompt` that exceeds its timeout kills the agent process outright —
+ACP cannot attribute late `session/update` notifications to an abandoned turn,
+so a fresh process is the only state that cannot corrupt the next turn's
+event stream. Stdin writes and `session.cancel` are bounded (10 s and 30 s
+respectively); an agent that wedges or ignores cancellation surfaces a
+transport error instead of stalling the host until the prompt budget expires.
+A single malformed JSON-RPC line from the agent fails only the in-flight turn;
+the process stays usable for subsequent turns.
+
 
 ## DSH TypeScript event projection
 
