@@ -39,10 +39,14 @@ fn setup(
 }
 
 fn request(session_id: &str) -> StartExecutionRequest {
+    request_with_prompt(session_id, "test prompt")
+}
+
+fn request_with_prompt(session_id: &str, prompt: &str) -> StartExecutionRequest {
     StartExecutionRequest {
         dsh_session_id: session_id.to_owned(),
         runtime_id: "mock".to_owned(),
-        prompt: "test prompt".to_owned(),
+        prompt: prompt.to_owned(),
         cwd: None,
         cancellation: CancellationToken::new(),
     }
@@ -83,7 +87,7 @@ async fn start_streams_events_and_reaches_completed() {
 async fn interrupt_converges_to_cancelled() {
     let (supervisor, _, _) = setup(Duration::from_millis(100));
     supervisor
-        .start(request("session-cancel"))
+        .start(request_with_prompt("session-cancel", "hang: cancel me"))
         .await
         .expect("start");
     let finished = supervisor
@@ -200,7 +204,7 @@ async fn continuation_starts_a_new_turn_with_the_same_external_session() {
 async fn one_shot_runtime_rejects_follow_up_input() {
     let (supervisor, _, _) = setup(Duration::from_millis(100));
     supervisor
-        .start(request("session-send"))
+        .start(request_with_prompt("session-send", "hang: never finishes"))
         .await
         .expect("start");
     let result = supervisor
@@ -217,7 +221,10 @@ async fn one_shot_runtime_rejects_follow_up_input() {
 async fn duplicate_session_start_is_rejected() {
     let (supervisor, _, _) = setup(Duration::from_millis(100));
     supervisor
-        .start(request("session-duplicate"))
+        .start(request_with_prompt(
+            "session-duplicate",
+            "hang: never finishes",
+        ))
         .await
         .expect("start");
     let result = supervisor.start(request("session-duplicate")).await;
@@ -232,7 +239,10 @@ async fn duplicate_session_start_is_rejected() {
 async fn shutdown_interrupts_active_sessions_and_rejects_new_work() {
     let (supervisor, _, _) = setup(Duration::from_millis(100));
     supervisor
-        .start(request("session-shutdown"))
+        .start(request_with_prompt(
+            "session-shutdown",
+            "hang: never finishes",
+        ))
         .await
         .expect("start");
     supervisor.shutdown().await.expect("shutdown");

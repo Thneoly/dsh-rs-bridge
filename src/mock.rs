@@ -10,6 +10,16 @@ use crate::contracts::{
     RuntimeSessionControl, RuntimeSessionHandle, RuntimeStartRequest, RuntimeStatus,
 };
 
+/// Prompts starting with this marker never reach a terminal state on their own;
+/// only an interrupt (or adapter shutdown) ends the turn. Tests that verify
+/// cancellation semantics use this to stay deterministic instead of racing a
+/// delay window, mirroring the `cancel-me` prompt of the ACP test fixture.
+const HANG_PROMPT_PREFIX: &str = "hang:";
+
+fn is_hang_prompt(prompt: &str) -> bool {
+    prompt.starts_with(HANG_PROMPT_PREFIX)
+}
+
 #[derive(Clone)]
 pub struct MockRuntime {
     id: String,
@@ -69,6 +79,7 @@ impl MockRuntime {
         delay: Duration,
         resumed: bool,
         tool_events: bool,
+        hang: bool,
     ) -> RuntimeSessionHandle {
         let (tx, rx) = mpsc::channel(32);
         let control = Arc::new(MockControl::new(tx));
@@ -83,6 +94,17 @@ impl MockRuntime {
                 .unwrap_or(false);
             if !emitted {
                 return;
+            }
+
+            if hang {
+                // Park until the turn is interrupted or the control side closes;
+                // polling lets the task terminate instead of leaking a timer.
+                loop {
+                    if task_control.is_done().await {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
             }
 
             if tool_events {
@@ -182,6 +204,7 @@ impl RuntimeAdapter for MockRuntime {
             self.delay,
             false,
             self.tool_events,
+            is_hang_prompt(&request.prompt),
         ))
     }
 
@@ -200,6 +223,7 @@ impl RuntimeAdapter for MockRuntime {
             self.delay,
             true,
             self.tool_events,
+            false,
         ))
     }
 
@@ -223,6 +247,7 @@ impl RuntimeAdapter for MockRuntime {
             self.delay,
             false,
             self.tool_events,
+            is_hang_prompt(&request.prompt),
         ))
     }
 }
@@ -270,6 +295,12 @@ impl MockControl {
             .await
             .map_err(|_| RuntimeError::Transport("mock event receiver closed".to_owned()))?;
         Ok(true)
+    }
+
+    /// Whether the turn already reached a terminal state or was closed.
+    async fn is_done(&self) -> bool {
+        let state = self.state.lock().await;
+        state.closed || state.terminal
     }
 
     async fn finish(
