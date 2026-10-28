@@ -1,7 +1,7 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
 
 use dsh_rs_bridge::{
-    AcpRuntime, AcpRuntimeConfig, ExecutionEventEnvelope, ExecutionEventSink, MemorySessionStore,
+    AcpRuntime, AcpRuntimeConfig, ExecutionEventEnvelope, ExecutionEventSink, FileSessionStore,
     MockRuntime, PersistedExecutionEvent, ResumeExecutionRequest, RuntimeError, RuntimeSupervisor,
     StartExecutionRequest,
 };
@@ -163,6 +163,11 @@ async fn dispatch(
                 .await?;
             serde_json::to_value(summary).map_err(|error| RuntimeError::Protocol(error.to_string()))
         }
+        "session.restore" => {
+            let params: SessionParams = parse_params(&request.params)?;
+            let summary = supervisor.restore_session(&params.dsh_session_id).await?;
+            serde_json::to_value(summary).map_err(|error| RuntimeError::Protocol(error.to_string()))
+        }
         "session.cancel" => {
             let params: CancelParams = parse_params(&request.params)?;
             let summary = supervisor
@@ -224,7 +229,10 @@ async fn write_response(
 async fn run_stdio() -> Result<(), RuntimeError> {
     let writer = JsonlWriter::new();
     let event_sink = Arc::new(JsonlEventSink::new(writer.clone()));
-    let sessions = Arc::new(MemorySessionStore::default());
+    let state_dir = std::env::var_os("DSH_RS_BRIDGE_STATE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(".dsh-rs-bridge"));
+    let sessions = Arc::new(FileSessionStore::open(state_dir.join("sessions.jsonl")).await?);
     let supervisor = RuntimeSupervisor::new(sessions, event_sink);
     let delay_ms = std::env::var("DSH_RS_BRIDGE_MOCK_DELAY_MS")
         .ok()

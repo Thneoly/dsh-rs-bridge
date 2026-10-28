@@ -12,7 +12,7 @@ This is not a rewrite of DSH and does not confuse a model API provider with a fu
 
 Implemented: Rust runtime contract and supervisor, versioned stdio JSONL server, real-process integration test, multi-turn continuation semantics, a TypeScript DSH AgentFactory/Session adapter, and an opt-in ACP v1 subprocess adapter with event translation and cancellation.
 
-Not implemented yet: durable external-session binding storage, restart-safe ACP resume, durable tool-event normalization, and vendor-specific CLI adapters.
+Not implemented yet: durable execution-event history, active in-flight turn recovery, durable normalized tool-event semantics, and vendor-specific CLI adapters.
 
 ## Requirements
 
@@ -83,3 +83,26 @@ node scripts/acp-smoke.mjs
 
 Override the command and JSON-array arguments for another ACP agent. The probe
 does not print environment variables or authentication material.
+
+
+## Durable runtime session bindings
+
+The bridge stores runtime session records in an append-only, versioned JSONL
+journal at `.dsh-rs-bridge/sessions.jsonl` by default. Set
+`DSH_RS_BRIDGE_STATE_DIR` to an absolute deployment-owned directory to choose a
+stable location. Every create/update is synced before acknowledgement; startup
+replays the latest record per DSH session and truncates an incomplete final
+journal line. The journal stores runtime IDs, external session IDs, status, and
+the host working directory — not credentials or conversation content.
+
+The `session.restore` RPC reconnects a persisted DSH session to its external
+agent conversation without claiming that an interrupted in-flight model turn
+can be resumed. ACP restoration uses `session/resume` when advertised, or
+`session/load` when that is the supported capability. If the bridge died
+during a turn, the prior runtime record is marked failed before restoration;
+the DSH AgentFactory repairs an incomplete DSH turn before publishing the
+resumed agent. A subsequent prompt continues the same external ACP session.
+
+The TypeScript AgentFactory now supports `resume({ resumeSessionId })` using
+the DSH JSONL persistence backend. The Rust binding journal and DSH session log
+must both be retained for full cross-process restoration.

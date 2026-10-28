@@ -55,6 +55,7 @@ impl MockRuntime {
         RuntimeCapabilities {
             streaming_events: true,
             resume: true,
+            session_restore: false,
             interrupt: true,
             live_input: false,
             continuation: self.continuation,

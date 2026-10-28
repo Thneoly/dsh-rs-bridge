@@ -19,6 +19,7 @@ import type { AssistantStreamFrame } from '@deepseek-ai/dsh-agent'
 import { createScope, scopeTarget } from '@deepseek-ai/dsh-scope'
 import type { Scope } from '@deepseek-ai/dsh-scope'
 import {
+  interruptedTurnClosers,
   SessionLogOffset,
   SessionPreparation,
   SessionSeq,
@@ -226,11 +227,13 @@ class RemoteRuntimeAgent implements Agent {
     private readonly runtimeId: string,
     private readonly bridge: JsonlBridgeClient,
     stored?: StoredSession,
+    externalSessionId?: string,
   ) {
     this.id = session.id
     this.session = session
     this.options = options
     this.stored = stored
+    this.externalSessionId = externalSessionId
     this.scope = createScope(hostCtx, this)
     this.ctx = this.scope.ctx
     this.carrier = scopeTarget(this, this)
@@ -707,11 +710,173 @@ export class BridgeAgentFactory implements AgentFactory {
     }
   }
 
-  async resume(_ownerCtx: Context, options: ResumeAgentOptions): Promise<AgentHandle> {
-    throw new Error(
-      'cannot resume DSH session ' + String(options.resumeSessionId) +
-      ': Rust runtime-session bindings are currently in-memory; durable binding storage is a prerequisite',
-    )
+  async resume(ownerCtx: Context, options: ResumeAgentOptions): Promise<AgentHandle> {
+    ownerCtx.fiber.assertActive()
+    const persistence = this.ctx.get('sessionPersistence') as SessionPersistence | undefined
+    if (persistence === undefined) {
+      throw new Error('cannot resume DSH session: session persistence is not configured')
+    }
+
+    let openedHandle: SessionHandle | undefined
+    let stored: StoredSession | undefined
+    let preparation: SessionPreparation | undefined
+    try {
+      const openPromise = persistence.open(options.resumeSessionId, 'write', {
+        ...(options.signal === undefined ? {} : { signal: options.signal }),
+      })
+      try {
+        openedHandle = await raceAbort(
+          openPromise,
+          options.signal,
+          'session persistence open cancelled',
+        )
+      } catch (error) {
+        void openPromise.then(handle => handle.close()).catch(() => {})
+        throw error
+      }
+
+      const coldRead = await raceAbort(
+        openedHandle.read(0, undefined, {
+          ...(options.signal === undefined ? {} : { signal: options.signal }),
+        }),
+        options.signal,
+        'session persistence read cancelled',
+      )
+      const persisted = [...coldRead.events]
+      const closers = interruptedTurnClosers(persisted)
+      if (closers.length > 0) {
+        await raceAbort(
+          openedHandle.append(closers, {
+            ...(options.signal === undefined ? {} : { signal: options.signal }),
+          }),
+          options.signal,
+          'interrupted-turn repair append cancelled',
+        )
+      }
+
+      preparation = SessionPreparation.create(this.ctx.sessions.prepare(options.resumeSessionId, {
+        seed: [...persisted, ...closers],
+        meta: structuredClone(openedHandle.header),
+        inheritedEventCount: openedHandle.inheritedEventCount,
+        eventState: coldRead.eventState,
+      }))
+      const session = preparation.session
+      stored = { handle: openedHandle, storedCount: persisted.length + closers.length }
+      openedHandle = undefined
+      await this.appendUnstoredSuffix(stored, session)
+
+      const restored = await raceAbort(
+        this.bridge.request<RuntimeExecutionSummary>('session.restore', {
+          dsh_session_id: String(options.resumeSessionId),
+        }),
+        options.signal,
+        'runtime session restore cancelled',
+      )
+      if (restored.external_session_id === null) {
+        throw new Error('runtime restore did not return an external session id')
+      }
+      const requestedRuntime = options.agentOptions?.runtimeId
+      if (requestedRuntime !== undefined && requestedRuntime !== restored.runtime_id) {
+        throw new Error(
+          'cannot resume DSH session ' + String(options.resumeSessionId) +
+          ' with runtime ' + requestedRuntime +
+          '; persisted session belongs to runtime ' + restored.runtime_id,
+        )
+      }
+
+      const agent = new RemoteRuntimeAgent(
+        this.ctx,
+        session,
+        options.agentOptions ?? {},
+        restored.runtime_id,
+        this.bridge,
+        stored,
+        restored.external_session_id,
+      )
+      let detachSession: (() => void) | undefined
+      let detachAgent: (() => void) | undefined
+      let teardownPromise: Promise<void> | undefined
+      const ownerAbort = new AbortController()
+      const lifecycleSignal = options.signal === undefined
+        ? ownerAbort.signal
+        : AbortSignal.any([options.signal, ownerAbort.signal])
+
+      const teardown = (): Promise<void> => teardownPromise ??= (async () => {
+        ownerAbort.abort(new Error('agent owner disposed: ' + String(options.resumeSessionId)))
+        agent.beginDispose()
+        const failures: unknown[] = []
+        try {
+          await agent.whenIdle()
+        } catch (error) {
+          failures.push(error)
+        }
+        try {
+          detachAgent?.()
+        } catch (error) {
+          failures.push(error)
+        }
+        try {
+          detachSession?.()
+        } catch (error) {
+          failures.push(error)
+        }
+        try {
+          await agent.scope.dispose()
+        } catch (error) {
+          failures.push(error)
+        }
+        try {
+          await stored?.handle.close()
+        } catch (error) {
+          failures.push(error)
+        } finally {
+          stored = undefined
+        }
+        this.live.delete(disposeHandle)
+        if (failures.length > 0) throw new AggregateError(failures, 'failed to dispose resumed DSH runtime agent')
+      })()
+
+      let ownerDisposer: (() => Promise<void> | void) | undefined
+      const disposeHandle = async (): Promise<void> => {
+        try {
+          await teardown()
+        } finally {
+          await ownerDisposer?.()
+        }
+      }
+      ownerDisposer = ownerCtx.effect(function* () {
+        yield async () => teardown()
+      }, 'dshRuntimeBridge.resume(' + String(options.resumeSessionId) + ')')
+      this.live.add(disposeHandle)
+
+      try {
+        lifecycleSignal.throwIfAborted()
+        const setupCommit = await raceAbort(
+          Promise.resolve(options.setup?.(agent.ctx, agent)),
+          lifecycleSignal,
+          'resumed agent setup cancelled',
+        )
+        setupCommit?.commit()
+        await this.appendUnstoredSuffix(stored, session)
+        lifecycleSignal.throwIfAborted()
+        detachSession = agent.ctx.sessions.enter(session)
+        detachAgent = this.ctx.agents.enter(agent, options.parentAgent)
+        agent.ctx.sessions.announce(session)
+        lifecycleSignal.throwIfAborted()
+        await this.ctx.agents.announce(agent, 'startup', lifecycleSignal)
+        lifecycleSignal.throwIfAborted()
+        return { agent, dispose: disposeHandle }
+      } catch (error) {
+        await teardown().catch(() => {})
+        throw error
+      }
+    } catch (error) {
+      await stored?.handle.close().catch(() => {})
+      throw error
+    } finally {
+      await openedHandle?.close().catch(() => {})
+      preparation?.[Symbol.dispose]()
+    }
   }
 
   async disposeAll(): Promise<void> {

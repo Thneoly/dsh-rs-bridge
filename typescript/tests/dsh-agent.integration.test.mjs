@@ -1,10 +1,13 @@
 import assert from 'node:assert/strict'
-import { resolve } from 'node:path'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join, resolve } from 'node:path'
 import { test } from 'node:test'
 import { Context } from '@deepseek-ai/cordis'
 import AgentRegistry from '@deepseek-ai/dsh-agent'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import SessionStore, { SessionId } from '@deepseek-ai/dsh-session'
+import * as JsonlSessionPersistence from '@deepseek-ai/dsh-session-persistence-jsonl'
 import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
 import { BridgeAgentFactory } from '../dist/agent-factory.js'
 import { JsonlBridgeClient } from '../dist/bridge-client.js'
@@ -26,6 +29,7 @@ test('DSH AgentFactory maps real Rust bridge turns into the DSH Session log', as
   let unregisterInbox
   let bridge
   let factory
+  const stateDir = mkdtempSync(join(tmpdir(), 'dsh-rs-bridge-ts-test-'))
   const processConfig = {
     command,
     args: ['--stdio'],
@@ -33,6 +37,7 @@ test('DSH AgentFactory maps real Rust bridge turns into the DSH Session log', as
     env: {
       DSH_RS_BRIDGE_MOCK_DELAY_MS: '5',
       DSH_RS_BRIDGE_MOCK_TOOL_EVENTS: '1',
+      DSH_RS_BRIDGE_STATE_DIR: stateDir,
     },
     requestTimeoutMs: 30000,
     shutdownTimeoutMs: 3000,
@@ -102,9 +107,123 @@ test('DSH AgentFactory maps real Rust bridge turns into the DSH Session log', as
     if (handle !== undefined) await handle.dispose()
     await factory.disposeAll()
     await bridge.shutdown()
+    rmSync(stateDir, { recursive: true, force: true })
     unregisterInbox()
     unregisterTurnBoundary()
     await pluginFiber.dispose()
     await ctx.fiber.dispose()
+  }
+})
+
+
+test('DSH AgentFactory restores persisted ACP conversation after bridge restart', async () => {
+  const command = process.env.DSH_RS_BRIDGE_BIN
+  const acpAgent = process.env.DSH_RS_BRIDGE_ACP_TEST_BIN
+  assert.ok(command, 'DSH_RS_BRIDGE_BIN must point to the built Rust bridge binary')
+  assert.ok(acpAgent, 'DSH_RS_BRIDGE_ACP_TEST_BIN must point to the built ACP fixture agent')
+
+  const persistenceRoot = mkdtempSync(join(tmpdir(), 'dsh-rs-bridge-session-log-'))
+  const stateDir = mkdtempSync(join(tmpdir(), 'dsh-rs-bridge-state-restart-'))
+  const ctx = new Context()
+  await ctx.plugin(SessionProjectionRegistry)
+  await ctx.plugin(AgentRegistry)
+  await ctx.plugin(SessionStore)
+  await ctx.plugin(JsonlSessionPersistence, {
+    root: persistenceRoot,
+    compression: 'none',
+  })
+
+  const unregisterTurnBoundary = ctx.sessionProjections.register(turnBoundaryProjectionDefinition)
+  const unregisterInbox = ctx.sessionProjections.register(inboxProjectionDefinition)
+  const processConfig = {
+    command,
+    args: ['--stdio'],
+    cwd: resolve(process.cwd(), '..'),
+    env: {
+      DSH_RS_BRIDGE_MOCK_DELAY_MS: '5',
+      DSH_RS_BRIDGE_STATE_DIR: stateDir,
+      DSH_RS_BRIDGE_ACP_COMMAND: acpAgent,
+      DSH_RS_BRIDGE_ACP_ARGS: '[]',
+    },
+    requestTimeoutMs: 30000,
+    shutdownTimeoutMs: 3000,
+  }
+  let bridge
+  let factory
+  let firstHandle
+  let resumedHandle
+  const sessionId = SessionId('dsh-acp-resume-e2e')
+  const cwd = resolve(process.cwd(), '..')
+
+  try {
+    bridge = new JsonlBridgeClient(ctx, processConfig)
+    factory = new BridgeAgentFactory(ctx, bridge, {
+      ...processConfig,
+      runtimeId: 'acp',
+    })
+    firstHandle = await factory.createAgent(ctx, {
+      sessionId,
+      meta: { cwd },
+      agentOptions: { runtimeId: 'acp' },
+    })
+    firstHandle.agent.followup(createUserMessage({
+      content: [{ type: 'text', text: 'before restart' }],
+      source: { kind: 'user' },
+    }))
+    await firstHandle.agent.whenIdle()
+
+    let events = firstHandle.agent.session.snapshotEvents()
+    let assistantMessages = events.filter(event => event.type === 'assistant/message')
+    assert.equal(assistantMessages.length, 1)
+    assert.equal(assistantMessages[0].data.message.content[0].text, 'ACP says: before restart')
+
+    await firstHandle.dispose()
+    firstHandle = undefined
+    await factory.disposeAll()
+    factory = undefined
+    await bridge.shutdown()
+    bridge = undefined
+
+    // A fresh bridge process loads the JSONL binding journal and the ACP
+    // adapter reattaches to the fixture agent's existing external session ID.
+    bridge = new JsonlBridgeClient(ctx, processConfig)
+    factory = new BridgeAgentFactory(ctx, bridge, {
+      ...processConfig,
+      runtimeId: 'acp',
+    })
+    resumedHandle = await factory.resume(ctx, {
+      resumeSessionId: sessionId,
+      agentOptions: { runtimeId: 'acp' },
+    })
+
+    events = resumedHandle.agent.session.snapshotEvents()
+    assistantMessages = events.filter(event => event.type === 'assistant/message')
+    assert.equal(assistantMessages.length, 1, 'restored DSH history must be preserved')
+
+    resumedHandle.agent.followup(createUserMessage({
+      content: [{ type: 'text', text: 'after restart' }],
+      source: { kind: 'user' },
+    }))
+    await resumedHandle.agent.whenIdle()
+
+    events = resumedHandle.agent.session.snapshotEvents()
+    assistantMessages = events.filter(event => event.type === 'assistant/message')
+    assert.equal(assistantMessages.length, 2)
+    assert.equal(assistantMessages[0].data.message.content[0].text, 'ACP says: before restart')
+    assert.equal(assistantMessages[1].data.message.content[0].text, 'ACP says: after restart')
+    assert.equal(
+      resumedHandle.agent.ctx.sessionProjections.stateOf(resumedHandle.agent.session, 'turnBoundary')?.lastTurn,
+      2,
+    )
+  } finally {
+    if (firstHandle !== undefined) await firstHandle.dispose().catch(() => {})
+    if (resumedHandle !== undefined) await resumedHandle.dispose().catch(() => {})
+    await factory?.disposeAll().catch(() => {})
+    await bridge?.shutdown().catch(() => {})
+    unregisterInbox()
+    unregisterTurnBoundary()
+    await ctx.fiber.dispose()
+    rmSync(persistenceRoot, { recursive: true, force: true })
+    rmSync(stateDir, { recursive: true, force: true })
   }
 })
