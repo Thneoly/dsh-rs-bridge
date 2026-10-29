@@ -11,13 +11,14 @@
 //   C  mid-stream cancellation: cancel after the first streamed delta -> turn.cancelled
 //   D  durable journal: sessions.jsonl replay matches the observed terminal states
 //   E  bridge restart + session.restore + another codeword recall on the SAME external session
+//   F  durable event replay: session.events returns the full cross-restart history
+//      with globally continuous host_seq (streaming, tools, permission, cancel, restore)
 //
 // Determinism notes:
 // - The codeword is a random per-run token, so the recall assertions verify real
 //   conversational memory without needing a judge model.
-// - host_seq is allocated per bridge process; after the phase-E restart it starts
-//   at 1 again. Ordering is therefore asserted per bridge process, and the restart
-//   is recorded in the report rather than treated as a violation.
+// - host_seq is allocated by the durable event journal, so it continues across
+//   the phase-E bridge restart; phase F asserts that continuity globally.
 //
 // Console output avoids prompt text, model output, credentials, and external IDs.
 // The on-disk report DOES contain full event payloads (including model output):
@@ -482,6 +483,64 @@ async function main() {
   const finalJournal = replaySessionJournal()
   assert.equal(finalJournal.records.get(sessionId)?.status, 'completed', 'journal status should be completed after phase E')
   phase('E restart + restore', 'bridge restarted, session restored, codeword recalled across the restart', startedAt)
+
+  // Phase F: durable event replay across the restart. The journal must hold
+  // the FULL history - streaming, tool, permission, cancel, and restore
+  // events from both bridge processes - with globally continuous host_seq.
+  startedAt = Date.now()
+  const replayed = await restarted.request(
+    'session.events',
+    { dsh_session_id: sessionId },
+    turnTimeoutMs,
+  )
+  const replayEntries = Array.isArray(replayed) ? replayed : []
+  const observedCount = recordedEvents.filter(
+    entry => entry.event?.dsh_session_id === sessionId,
+  ).length
+  assert.ok(
+    replayEntries.length >= observedCount,
+    `session.events replay (${replayEntries.length}) must cover everything observed on stdout (${observedCount})`,
+  )
+  let previousSeq = 0
+  for (const entry of replayEntries) {
+    const seq = entry?.host_seq
+    assert.ok(
+      typeof seq === 'number' && seq > previousSeq,
+      `replayed host_seq must strictly increase globally: ${seq} after ${previousSeq}`,
+    )
+    previousSeq = seq
+  }
+  assert.ok(
+    !report.hostSeqRestartObserved,
+    'host_seq must continue across the bridge restart, not restart at 1',
+  )
+  const replayHas = (type, payloadTest = () => true) =>
+    replayEntries.some(
+      entry => entry?.event?.event_type === type && payloadTest(entry.event.payload ?? {}),
+    )
+  assert.ok(
+    replayHas('assistant.delta', payload =>
+      String(payload.text ?? '').toUpperCase().includes(codeWord)),
+    'replay must contain the pre-restart codeword streaming',
+  )
+  assert.ok(
+    replayHas('tool.started') || replayHas('tool.completed'),
+    'replay must contain the tool lifecycle from phase T',
+  )
+  assert.ok(
+    replayHas('permission.requested') && replayHas('permission.responded'),
+    'replay must contain the permission round-trip from phase T',
+  )
+  assert.ok(replayHas('turn.cancelled'), 'replay must contain the phase-C cancellation')
+  assert.ok(
+    replayHas('runtime.session_restored'),
+    'replay must contain the phase-E restore',
+  )
+  phase(
+    'F durable event replay',
+    `session.events returned ${replayEntries.length} events with continuous host_seq across the restart`,
+    startedAt,
+  )
 }
 
 let exitCode = 0

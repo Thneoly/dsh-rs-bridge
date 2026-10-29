@@ -20,10 +20,12 @@ The Rust server exposes a versioned JSONL protocol over stdio and registers a de
 
 Beyond fixtures, `scripts/bridge-acp-e2e.mjs` is an opt-in, credentialed
 full-conversation acceptance gate against a real ACP agent. It drives one
-continuous conversation through streaming, same-session recall, mid-stream
-cancellation, durable-journal assertions, and a bridge restart with
-`session.restore` plus post-restore recall. It is run manually (it spends real
-model tokens); CI covers the agent handshake and fixture-based execution only.
+continuous conversation through streaming, same-session recall, a tool turn
+with a permission round-trip, mid-stream cancellation, durable-journal
+assertions, a bridge restart with `session.restore` plus post-restore recall,
+and finally a durable event replay that must return the full cross-restart
+history with continuous `host_seq`. It is run manually (it spends real model
+tokens); CI covers the agent handshake and fixture-based execution only.
 
 ## Protocol
 
@@ -104,14 +106,24 @@ durable tool-call semantics are tied to assistant tool-call blocks and matching
 call/result identities.
 
 
-## Durable bindings and conversation restoration
+## Durable bindings, events, and conversation restoration
 
-The executable defaults to a file-backed session binding journal under
-`.dsh-rs-bridge/sessions.jsonl`; `DSH_RS_BRIDGE_STATE_DIR` overrides the root.
-The journal is append-only JSONL with a versioned record envelope, sync-on-write
-durability, latest-record replay, and torn-tail repair. The persisted record
-contains the DSH session ID, runtime ID, opaque external session ID, status,
-timestamps, and optional working directory.
+The executable defaults to file-backed journals under `.dsh-rs-bridge/`;
+`DSH_RS_BRIDGE_STATE_DIR` overrides the root. The session binding journal
+(`sessions.jsonl`) is append-only JSONL with a versioned record envelope,
+sync-on-write durability, latest-record replay, and torn-tail repair. The
+persisted record contains the DSH session ID, runtime ID, opaque external
+session ID, status, timestamps, and optional working directory.
+
+The execution event journal (`events.jsonl`) applies the same durability
+discipline to the full event stream: every event is journaled (and synced)
+before it is forwarded to the host on stdout, the journal allocates the
+per-DSH-session `host_seq` and seeds it from replay at startup so sequences
+continue across bridge restarts, and `session.events` replays a session's
+history — optionally strictly after a given `host_seq` — so hosts can close
+the restart gap. The event journal is runtime observability data (it includes
+assistant output and tool payloads by design) and stays separate from both
+the binding journal and DSH's own durable session event log.
 
 `session.restore` is distinct from `session.resume`: the former reconnects an
 idle conversation after the bridge process restarts, while the latter remains
