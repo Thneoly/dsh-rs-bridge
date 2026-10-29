@@ -13,7 +13,7 @@ static NEXT_STATE_DIR: AtomicU64 = AtomicU64::new(1);
 
 struct BridgeProcess {
     child: Child,
-    state_dir: PathBuf,
+    state_dir: Option<PathBuf>,
     stdin: Option<ChildStdin>,
     stdout: BufReader<ChildStdout>,
     next_id: u64,
@@ -28,6 +28,10 @@ impl BridgeProcess {
             NEXT_STATE_DIR.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&state_dir).expect("create isolated bridge state directory");
+        Self::spawn_in(state_dir)
+    }
+
+    fn spawn_in(state_dir: PathBuf) -> Self {
         let mut child = Command::new(env!("CARGO_BIN_EXE_dsh-rs-bridge"))
             .arg("--stdio")
             .env("DSH_RS_BRIDGE_MOCK_DELAY_MS", "60")
@@ -41,7 +45,7 @@ impl BridgeProcess {
         let stdout = BufReader::new(child.stdout.take().expect("child stdout"));
         Self {
             child,
-            state_dir,
+            state_dir: Some(state_dir),
             stdin: Some(stdin),
             stdout,
             next_id: 0,
@@ -94,7 +98,19 @@ impl BridgeProcess {
         self.stdin.take();
         let status = self.child.wait().expect("wait for bridge exit");
         assert!(status.success(), "bridge exited unsuccessfully: {status}");
-        let _ = std::fs::remove_dir_all(&self.state_dir);
+        if let Some(state_dir) = self.state_dir.take() {
+            let _ = std::fs::remove_dir_all(state_dir);
+        }
+    }
+
+    /// Shut down but keep the state directory for a successor bridge.
+    fn shutdown_and_keep(&mut self) {
+        let result = self.call("bridge.shutdown", json!({}));
+        assert_eq!(result["stopping"], true);
+        self.stdin.take();
+        let status = self.child.wait().expect("wait for bridge exit");
+        assert!(status.success(), "bridge exited unsuccessfully: {status}");
+        self.state_dir = None;
     }
 }
 
@@ -104,7 +120,9 @@ impl Drop for BridgeProcess {
             let _ = self.child.kill();
             let _ = self.child.wait();
         }
-        let _ = std::fs::remove_dir_all(&self.state_dir);
+        if let Some(state_dir) = self.state_dir.take() {
+            let _ = std::fs::remove_dir_all(state_dir);
+        }
     }
 }
 
@@ -216,4 +234,160 @@ fn jsonl_process_supports_runtime_discovery_start_wait_continue_cancel_and_shutd
     );
 
     bridge.shutdown_and_wait();
+}
+
+#[test]
+fn jsonl_process_replays_events_across_restart_with_continuous_sequence() {
+    let state_dir = std::env::temp_dir().join(format!(
+        "dsh-rs-bridge-process-restart-{}-{}",
+        std::process::id(),
+        NEXT_STATE_DIR.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&state_dir).expect("create shared bridge state directory");
+
+    let mut first = BridgeProcess::spawn_in(state_dir.clone());
+    let started = first.call(
+        "session.start",
+        json!({
+            "dsh_session_id": "events-session",
+            "runtime_id": "mock",
+            "prompt": "before restart",
+            "cwd": null
+        }),
+    );
+    assert_eq!(started["status"], "running");
+    let terminal = first.call(
+        "session.wait",
+        json!({ "dsh_session_id": "events-session" }),
+    );
+    assert_eq!(terminal["status"], "completed");
+    first.shutdown_and_keep();
+    drop(first);
+
+    // The successor bridge replays the durable event journal: the full
+    // pre-restart history is available and host_seq does not restart at 1.
+    let mut second = BridgeProcess::spawn_in(state_dir);
+    let replayed = second.call(
+        "session.events",
+        json!({ "dsh_session_id": "events-session" }),
+    );
+    let entries = replayed.as_array().expect("replayed events array");
+    assert!(!entries.is_empty(), "pre-restart events must survive");
+    assert!(entries
+        .iter()
+        .any(|entry| entry["event"]["event_type"] == "assistant.delta"));
+    assert!(entries
+        .iter()
+        .any(|entry| entry["event"]["event_type"] == "turn.completed"));
+    let before_max = entries
+        .iter()
+        .map(|entry| entry["host_seq"].as_u64().expect("host seq"))
+        .max()
+        .expect("max host seq");
+
+    let sent = second.call(
+        "session.send",
+        json!({
+            "dsh_session_id": "events-session",
+            "text": "after restart"
+        }),
+    );
+    assert_eq!(sent["accepted"], true);
+    let terminal = second.call(
+        "session.wait",
+        json!({ "dsh_session_id": "events-session" }),
+    );
+    assert_eq!(terminal["status"], "completed");
+
+    let tail = second.call(
+        "session.events",
+        json!({
+            "dsh_session_id": "events-session",
+            "after_host_seq": before_max
+        }),
+    );
+    let tail_entries = tail.as_array().expect("tail events array");
+    assert!(!tail_entries.is_empty(), "post-restart events must replay");
+    assert_eq!(
+        tail_entries[0]["host_seq"].as_u64(),
+        Some(before_max + 1),
+        "host_seq must continue across the restart, not restart at 1"
+    );
+    assert!(tail_entries
+        .iter()
+        .all(|entry| entry["host_seq"].as_u64().unwrap_or(0) > before_max));
+
+    // The stdout runtime.event notifications and the journal must share ONE
+    // numbering space: the after_host_seq catch-up protocol only works if a
+    // notification's host_seq is the same number the journal replays.
+    let notified_seqs: Vec<u64> = second
+        .notifications
+        .iter()
+        .filter(|notification| {
+            notification["params"]["event"]["dsh_session_id"] == "events-session"
+        })
+        .map(|notification| {
+            notification["params"]["host_seq"]
+                .as_u64()
+                .expect("notification host seq")
+        })
+        .collect();
+    assert!(
+        !notified_seqs.is_empty(),
+        "post-restart turn must notify events"
+    );
+    let full_replay = second.call(
+        "session.events",
+        json!({ "dsh_session_id": "events-session" }),
+    );
+    let replay_seqs: std::collections::HashSet<u64> = full_replay
+        .as_array()
+        .expect("full replay array")
+        .iter()
+        .map(|entry| entry["host_seq"].as_u64().expect("replay host seq"))
+        .collect();
+    for seq in &notified_seqs {
+        assert!(
+            replay_seqs.contains(seq),
+            "stdout host_seq {seq} must exist in the journal replay"
+        );
+    }
+    assert_eq!(
+        notified_seqs.iter().max(),
+        replay_seqs.iter().max(),
+        "stdout notifications and journal replay must share the numbering space"
+    );
+
+    second.shutdown_and_wait();
+}
+
+#[test]
+fn second_bridge_refuses_to_share_the_state_directory() {
+    let state_dir = std::env::temp_dir().join(format!(
+        "dsh-rs-bridge-process-exclusive-{}-{}",
+        std::process::id(),
+        NEXT_STATE_DIR.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&state_dir).expect("create shared bridge state directory");
+    let first = BridgeProcess::spawn_in(state_dir.clone());
+
+    // A second bridge on the same state directory must refuse to start:
+    // silent dual writers would duplicate host_seq values in the journals.
+    let mut second = BridgeProcess::spawn_in(state_dir.clone());
+    let mut exited = None;
+    for _ in 0..100 {
+        if let Some(status) = second.child.try_wait().expect("poll second bridge") {
+            exited = Some(status);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let status = exited.expect("second bridge must exit when the state dir is locked");
+    assert!(
+        !status.success(),
+        "the second bridge must fail loudly instead of sharing the journals"
+    );
+    drop(second);
+    drop(first);
+    let _ = std::fs::remove_dir_all(state_dir);
 }

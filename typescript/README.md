@@ -42,6 +42,7 @@ Per-agent engine selection is available through the merge-extensible DSH `AgentO
 
 - DSH creates and owns the Agent and Session; the Rust process owns the external runtime session and execution lifecycle.
 - Each external execution maps to one DSH turn and one step. User input, assistant output, step/turn boundaries, inbox splices, and terminal status are written to the DSH Session.
+- The bridge's own durable event journal (`events.jsonl`, replayable through the bridge RPC `session.events`) is available for host-side catch-up; this plugin does not consume it yet — DSH history remains the source of truth for resume.
 - Assistant deltas are published as transient `agent/assistant-stream` start/chunk/end frames and compacted into the final durable `assistant/message` or `assistant/attempt` event.
 - External `tool.*` events are surfaced as transient `agent/runtime-event` notifications. They are deliberately not rewritten as DSH `tool/call` / `tool/result` events because an external agent's internal tool cycle is not necessarily a DSH model tool-call cycle.
 - `AgentFactory.resume()` opens the existing DSH JSONL session for write, repairs an interrupted final turn, restores the Rust bridge binding, and reattaches the existing external conversation. The Rust binding journal and DSH session-persistence root must both survive restart.

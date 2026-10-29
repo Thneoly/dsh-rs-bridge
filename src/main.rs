@@ -1,9 +1,9 @@
 use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
 
 use dsh_rs_bridge::{
-    AcpRuntime, AcpRuntimeConfig, ExecutionEventEnvelope, ExecutionEventSink, FileSessionStore,
-    MockRuntime, PersistedExecutionEvent, ResumeExecutionRequest, RuntimeError, RuntimeSupervisor,
-    StartExecutionRequest,
+    AcpRuntime, AcpRuntimeConfig, ExecutionEventEnvelope, ExecutionEventSink, FileEventJournal,
+    FileSessionStore, MockRuntime, PersistedExecutionEvent, ResumeExecutionRequest, RuntimeError,
+    RuntimeSupervisor, StartExecutionRequest,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -44,29 +44,18 @@ impl JsonlWriter {
     }
 }
 
-struct JsonlEventSink {
+/// Durable event sink: every event is journaled first (which allocates the
+/// restart-continuous host_seq), then forwarded to the host on stdout. The
+/// stdout notification carries the same sequence number the journal holds.
+struct DurableEventSink {
+    journal: std::sync::Arc<FileEventJournal>,
     writer: JsonlWriter,
-    sequences: Mutex<HashMap<String, u64>>,
-}
-
-impl JsonlEventSink {
-    fn new(writer: JsonlWriter) -> Self {
-        Self {
-            writer,
-            sequences: Mutex::new(HashMap::new()),
-        }
-    }
 }
 
 #[async_trait::async_trait]
-impl ExecutionEventSink for JsonlEventSink {
+impl ExecutionEventSink for DurableEventSink {
     async fn append(&self, event: ExecutionEventEnvelope) -> Result<u64, RuntimeError> {
-        let host_seq = {
-            let mut sequences = self.sequences.lock().await;
-            let sequence = sequences.entry(event.dsh_session_id.clone()).or_insert(0);
-            *sequence += 1;
-            *sequence
-        };
+        let host_seq = self.journal.append(event.clone()).await?;
         let persisted = PersistedExecutionEvent { host_seq, event };
         self.writer
             .write_value(&json!({
@@ -120,6 +109,13 @@ struct SendParams {
 }
 
 #[derive(Debug, Deserialize)]
+struct SessionEventsParams {
+    dsh_session_id: String,
+    #[serde(default)]
+    after_host_seq: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
 struct PermissionRespondParams {
     dsh_session_id: String,
     request_id: String,
@@ -133,6 +129,7 @@ struct ProbeParams {
 
 async fn dispatch(
     supervisor: &RuntimeSupervisor,
+    journal: &FileEventJournal,
     request: &RpcRequest,
 ) -> Result<Value, RuntimeError> {
     match request.method.as_str() {
@@ -206,6 +203,13 @@ async fn dispatch(
                 .await?;
             Ok(json!({ "delivered": true }))
         }
+        "session.events" => {
+            let params: SessionEventsParams = parse_params(&request.params)?;
+            let events = journal
+                .replay(&params.dsh_session_id, params.after_host_seq)
+                .await?;
+            serde_json::to_value(events).map_err(|error| RuntimeError::Protocol(error.to_string()))
+        }
         "bridge.shutdown" => {
             supervisor.shutdown().await?;
             Ok(json!({ "stopping": true }))
@@ -244,13 +248,55 @@ async fn write_response(
     writer.write_value(&response).await
 }
 
+/// Exclusive ownership of the state directory. The journals assume a single
+/// writer: two bridge processes sharing `DSH_RS_BRIDGE_STATE_DIR` would
+/// allocate duplicate `host_seq` values silently. The guard is a lock file
+/// created with create-new semantics and held for the process lifetime.
+struct StateDirGuard {
+    _file: std::fs::File,
+}
+
+fn acquire_state_dir(state_dir: &std::path::Path) -> Result<StateDirGuard, RuntimeError> {
+    std::fs::create_dir_all(state_dir).map_err(|error| {
+        RuntimeError::Persistence(format!(
+            "create state directory {}: {error}",
+            state_dir.display()
+        ))
+    })?;
+    let lock_path = state_dir.join("bridge.lock");
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&lock_path)
+    {
+        Ok(file) => Ok(StateDirGuard { _file: file }),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            Err(RuntimeError::Persistence(format!(
+                "another dsh-rs-bridge owns the state directory {} ({} exists). \
+                 Stop the other bridge first; if none is running, remove the stale lock file.",
+                state_dir.display(),
+                lock_path.display()
+            )))
+        }
+        Err(error) => Err(RuntimeError::Persistence(format!(
+            "create lock file {}: {error}",
+            lock_path.display()
+        ))),
+    }
+}
+
 async fn run_stdio() -> Result<(), RuntimeError> {
     let writer = JsonlWriter::new();
-    let event_sink = Arc::new(JsonlEventSink::new(writer.clone()));
     let state_dir = std::env::var_os("DSH_RS_BRIDGE_STATE_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(".dsh-rs-bridge"));
+    let _state_guard = acquire_state_dir(&state_dir)?;
     let sessions = Arc::new(FileSessionStore::open(state_dir.join("sessions.jsonl")).await?);
+    let journal = Arc::new(FileEventJournal::open(state_dir.join("events.jsonl")).await?);
+    let event_sink = Arc::new(DurableEventSink {
+        journal: journal.clone(),
+        writer: writer.clone(),
+    });
     let supervisor = RuntimeSupervisor::new(sessions, event_sink);
     let delay_ms = std::env::var("DSH_RS_BRIDGE_MOCK_DELAY_MS")
         .ok()
@@ -333,9 +379,10 @@ async fn run_stdio() -> Result<(), RuntimeError> {
         let shutdown = request.method == "bridge.shutdown";
         let task_writer = writer.clone();
         let task_supervisor = supervisor.clone();
+        let task_journal = journal.clone();
         pending.spawn(async move {
             let id = request.id.clone();
-            let result = dispatch(&task_supervisor, &request).await;
+            let result = dispatch(&task_supervisor, &task_journal, &request).await;
             if let Err(error) = write_response(&task_writer, &id, result).await {
                 eprintln!("dsh-rs-bridge: response write failed: {error}");
             }
@@ -350,6 +397,11 @@ async fn run_stdio() -> Result<(), RuntimeError> {
             eprintln!("dsh-rs-bridge: request task failed: {error}");
         }
     }
+
+    // Release the state directory for a successor bridge. A crashed process
+    // leaves the lock behind on purpose; the next start reports it loudly.
+    drop(_state_guard);
+    let _ = std::fs::remove_file(state_dir.join("bridge.lock"));
     Ok(())
 }
 
@@ -372,6 +424,7 @@ async fn main() {
                     "session.cancel",
                     "session.wait",
                     "session.send",
+                    "session.events",
                     "permission.respond"
                 ]
             })
