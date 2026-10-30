@@ -36,6 +36,18 @@ the safe default); DSH exposes no interactive host channel to the Agent yet,
 so both the question and the automatic answer are also surfaced as transient
 `agent/runtime-event` notifications for audit and a future permission UI.
 
+## Self-healing after a bridge crash
+
+If the bridge process dies unexpectedly, the plugin does not brick: the
+client respawns it (`autoRespawn`, default true, bounded by `maxRestarts`,
+default 5) and emits `bridge-restarted`. Each live agent then reattaches its
+persisted binding via `session.restore` before its next continuation, so the
+conversation carries on with the same external session. A turn that was in
+flight when the crash happened settles as failed and repairs through the
+standard interrupted-turn path. The durable journals make this sound:
+`host_seq` continues across the restart and the OS-level state-directory lock
+releases when the process dies, so the successor takes over cleanly.
+
 Per-agent engine selection is available through the merge-extensible DSH `AgentOptions` field `runtimeId`. The selected ID must be registered by the Rust bridge's `runtime.list` / `runtime.probe`.
 
 ## Current integration boundary

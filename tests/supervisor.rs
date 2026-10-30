@@ -84,6 +84,84 @@ async fn start_streams_events_and_reaches_completed() {
 }
 
 #[tokio::test]
+async fn start_tolerates_orphaned_records_left_by_a_dead_bridge() {
+    use dsh_rs_bridge::{RuntimeSessionRecord, RuntimeStatus};
+
+    let (supervisor, sessions, _) = setup(Duration::from_millis(1));
+
+    // Leftover from a start that crashed mid-launch: a record with no
+    // external binding. A fresh start must take the slot over.
+    let orphan = RuntimeSessionRecord {
+        dsh_session_id: "session-orphan".to_owned(),
+        runtime_id: "mock".to_owned(),
+        external_session_id: None,
+        cwd: None,
+        status: RuntimeStatus::Failed,
+        created_at_ms: 1,
+        updated_at_ms: 1,
+    };
+    sessions.create(orphan).await.expect("seed orphan record");
+    let started = supervisor
+        .start(request("session-orphan"))
+        .await
+        .expect("start over an orphaned unbound record");
+    assert_eq!(started.status, RuntimeStatus::Running);
+    let finished = supervisor
+        .wait_for_terminal("session-orphan")
+        .await
+        .expect("orphan takeover terminal");
+    assert_eq!(finished.status, RuntimeStatus::Completed);
+
+    // Leftover from a process that died mid-turn: a stale non-terminal record
+    // WITH a binding. `start` means a new execution, so the slot is reused.
+    let stale = RuntimeSessionRecord {
+        dsh_session_id: "session-stale".to_owned(),
+        runtime_id: "mock".to_owned(),
+        external_session_id: Some("mock::old".to_owned()),
+        cwd: None,
+        status: RuntimeStatus::Running,
+        created_at_ms: 1,
+        updated_at_ms: 1,
+    };
+    sessions.create(stale).await.expect("seed stale record");
+    let restarted = supervisor
+        .start(request("session-stale"))
+        .await
+        .expect("start over a stale non-terminal record");
+    assert_ne!(
+        restarted.external_session_id.as_deref(),
+        Some("mock::old"),
+        "the fresh execution must not inherit the dead binding"
+    );
+
+    // A record that already owns a TERMINAL conversation keeps refusing
+    // start: continuation and restoration are its entry points.
+    let finished_record = sessions
+        .get("session-orphan")
+        .await
+        .expect("store")
+        .expect("record");
+    let bound = finished_record.clone();
+    let mut bound_session = bound;
+    bound_session.dsh_session_id = "session-bound".to_owned();
+    sessions
+        .create(bound_session)
+        .await
+        .expect("seed bound record");
+    let refusal = supervisor
+        .start(request("session-bound"))
+        .await
+        .expect_err("start must refuse a bound session");
+    assert!(matches!(refusal, RuntimeError::Lifecycle(_)));
+    assert!(
+        refusal.to_string().contains("session.send"),
+        "the refusal must point at continuation, got: {refusal}"
+    );
+
+    supervisor.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
 async fn interrupt_converges_to_cancelled() {
     let (supervisor, _, _) = setup(Duration::from_millis(100));
     supervisor

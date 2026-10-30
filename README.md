@@ -10,7 +10,7 @@ This is not a rewrite of DSH and does not confuse a model API provider with a fu
 
 ## Current status
 
-Implemented: Rust runtime contract and supervisor, versioned stdio JSONL server, real-process integration test, multi-turn continuation semantics, a TypeScript DSH AgentFactory/Session adapter, an opt-in ACP v1 subprocess adapter with event translation, cancellation, permission forwarding, and failure containment, plus durable session bindings and a durable execution-event journal with cross-restart replay.
+Implemented: Rust runtime contract and supervisor, versioned stdio JSONL server, real-process integration test, multi-turn continuation semantics, a TypeScript DSH AgentFactory/Session adapter, an opt-in ACP v1 subprocess adapter with event translation, cancellation, permission forwarding, and failure containment, durable session bindings and a durable execution-event journal with cross-restart replay, and TypeScript-side self-healing (bridge respawn plus automatic `session.restore` on the next turn after a crash).
 
 Not implemented yet: active in-flight turn recovery (an interrupted turn is closed as failed, then restored), durable normalized DSH tool-call semantics, and vendor-specific CLI adapters.
 
@@ -59,12 +59,11 @@ The event journal is runtime observability data: it **does contain model
 output** (that is what makes replay possible), but no credentials. Retain both
 files (plus DSH's own session log) for full recovery.
 
-One bridge owns a state directory at a time: startup takes an exclusive
-`bridge.lock` and a second bridge on the same directory refuses to start
-(journals assume a single writer — dual writers would duplicate `host_seq`
-silently). The lock is released on orderly shutdown; after a crash the next
-start reports the stale lock and names the file to remove once no bridge is
-running.
+One bridge owns a state directory at a time: startup takes an OS-level
+exclusive lock on `bridge.lock` and a second live bridge on the same directory
+refuses to start (journals assume a single writer — dual writers would
+duplicate `host_seq` silently). The OS releases the lock when the process
+dies, orderly or not, so a crashed bridge never blocks its successor.
 
 ### RPC quick reference
 

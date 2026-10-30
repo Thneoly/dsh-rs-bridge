@@ -369,7 +369,11 @@ fn second_bridge_refuses_to_share_the_state_directory() {
         NEXT_STATE_DIR.fetch_add(1, Ordering::Relaxed)
     ));
     std::fs::create_dir_all(&state_dir).expect("create shared bridge state directory");
-    let first = BridgeProcess::spawn_in(state_dir.clone());
+    let mut first = BridgeProcess::spawn_in(state_dir.clone());
+    // A successful RPC proves the first bridge is up and holds the state
+    // directory lock; without this the two spawns race for the lock.
+    let runtimes = first.call("runtime.list", json!({}));
+    assert_eq!(runtimes.as_array().map(Vec::len), Some(1));
 
     // A second bridge on the same state directory must refuse to start:
     // silent dual writers would duplicate host_seq values in the journals.
@@ -388,6 +392,34 @@ fn second_bridge_refuses_to_share_the_state_directory() {
         "the second bridge must fail loudly instead of sharing the journals"
     );
     drop(second);
+    first.shutdown_and_keep();
     drop(first);
     let _ = std::fs::remove_dir_all(state_dir);
+}
+
+#[test]
+fn successor_bridge_takes_over_after_a_hard_kill() {
+    let state_dir = std::env::temp_dir().join(format!(
+        "dsh-rs-bridge-process-takeover-{}-{}",
+        std::process::id(),
+        NEXT_STATE_DIR.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&state_dir).expect("create shared bridge state directory");
+    let mut first = BridgeProcess::spawn_in(state_dir.clone());
+    // A hard kill leaves no orderly shutdown: the OS-level lock must release
+    // with the process so a respawned successor can take the directory over
+    // (this is exactly the TypeScript plugin's self-healing path).
+    first.child.kill().expect("hard-kill first bridge");
+    let _ = first.child.wait();
+    first.state_dir = None;
+    drop(first);
+
+    let mut second = BridgeProcess::spawn_in(state_dir);
+    let runtimes = second.call("runtime.list", json!({}));
+    assert_eq!(
+        runtimes.as_array().map(Vec::len),
+        Some(1),
+        "the successor must start and serve after the owner died"
+    );
+    second.shutdown_and_wait();
 }

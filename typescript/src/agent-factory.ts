@@ -226,6 +226,10 @@ class RemoteRuntimeAgent implements Agent {
   private cancelCause?: AgentCancelCause
   private streamRevision = 0
   private attemptCounter = 0
+  /** Set when the bridge process respawned: the persisted binding must be
+   * reattached (session.restore) before the next continuation. */
+  private needsRestore = false
+  private readonly onBridgeRestarted: () => void
 
   constructor(
     private readonly hostCtx: Context,
@@ -247,6 +251,17 @@ class RemoteRuntimeAgent implements Agent {
     this.ctx = this.scope.ctx
     this.carrier = scopeTarget(this, this)
     this.inbox = new DurableInbox(this, session)
+    this.onBridgeRestarted = () => {
+      this.needsRestore = true
+    }
+    this.bridge.on('bridge-restarted', this.onBridgeRestarted)
+    const bridgeRef = this.bridge
+    const listener = this.onBridgeRestarted
+    this.ctx.effect(function* () {
+      yield () => {
+        bridgeRef.off('bridge-restarted', listener)
+      }
+    }, 'dshRuntimeBridge.bridgeRestartedListener()')
   }
 
   get status(): AgentStatus {
@@ -521,6 +536,9 @@ class RemoteRuntimeAgent implements Agent {
     let terminalStatus: RuntimeExecutionSummary['status'] = 'failed'
     try {
       if (this.externalSessionId === undefined) {
+        // A start that crashed mid-launch may have left an orphaned record in
+        // the bridge journal; the bridge tolerates re-starting over it.
+        this.needsRestore = false
         const started = await this.bridge.request<RuntimeExecutionSummary>('session.start', {
           dsh_session_id: String(this.id),
           runtime_id: this.runtimeId,
@@ -532,6 +550,18 @@ class RemoteRuntimeAgent implements Agent {
         }
         this.externalSessionId = started.external_session_id
       } else {
+        if (this.needsRestore) {
+          // The bridge process died and respawned: its in-process session map
+          // is empty, so reattach the persisted binding before continuing.
+          const restored = await this.bridge.request<RuntimeExecutionSummary>('session.restore', {
+            dsh_session_id: String(this.id),
+          })
+          if (restored.external_session_id === null) {
+            throw new Error('session restore did not return the external session id')
+          }
+          this.externalSessionId = restored.external_session_id
+          this.needsRestore = false
+        }
         await this.bridge.request<{ accepted: boolean }>('session.send', {
           dsh_session_id: String(this.id),
           text: prompt,

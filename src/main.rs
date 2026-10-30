@@ -250,13 +250,17 @@ async fn write_response(
 
 /// Exclusive ownership of the state directory. The journals assume a single
 /// writer: two bridge processes sharing `DSH_RS_BRIDGE_STATE_DIR` would
-/// allocate duplicate `host_seq` values silently. The guard is a lock file
-/// created with create-new semantics and held for the process lifetime.
+/// allocate duplicate `host_seq` values silently. The guard is an OS-level
+/// exclusive lock on `bridge.lock` held for the process lifetime: the OS
+/// releases it when the process dies, so a crashed bridge never leaves a
+/// stale lock behind and a respawned successor takes over cleanly.
 struct StateDirGuard {
     _file: std::fs::File,
 }
 
 fn acquire_state_dir(state_dir: &std::path::Path) -> Result<StateDirGuard, RuntimeError> {
+    use fs4::fs_std::FileExt;
+
     std::fs::create_dir_all(state_dir).map_err(|error| {
         RuntimeError::Persistence(format!(
             "create state directory {}: {error}",
@@ -264,23 +268,26 @@ fn acquire_state_dir(state_dir: &std::path::Path) -> Result<StateDirGuard, Runti
         ))
     })?;
     let lock_path = state_dir.join("bridge.lock");
-    match std::fs::OpenOptions::new()
+    let file = std::fs::OpenOptions::new()
         .write(true)
-        .create_new(true)
+        .create(true)
+        .truncate(false)
         .open(&lock_path)
-    {
-        Ok(file) => Ok(StateDirGuard { _file: file }),
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            Err(RuntimeError::Persistence(format!(
-                "another dsh-rs-bridge owns the state directory {} ({} exists). \
-                 Stop the other bridge first; if none is running, remove the stale lock file.",
-                state_dir.display(),
-                lock_path.display()
-            )))
-        }
+        .map_err(|error| {
+            RuntimeError::Persistence(format!("open lock file {}: {error}", lock_path.display()))
+        })?;
+    // fs4's try_lock_exclusive returns Ok(false) — not Err — when another
+    // process holds the lock; only Ok(true) means the directory is ours.
+    match file.try_lock_exclusive() {
+        Ok(true) => Ok(StateDirGuard { _file: file }),
+        Ok(false) => Err(RuntimeError::Persistence(format!(
+            "another dsh-rs-bridge owns the state directory {}. \
+             Stop the other bridge before starting a replacement.",
+            state_dir.display()
+        ))),
         Err(error) => Err(RuntimeError::Persistence(format!(
-            "create lock file {}: {error}",
-            lock_path.display()
+            "lock the state directory {}: {error}",
+            state_dir.display()
         ))),
     }
 }
@@ -398,10 +405,8 @@ async fn run_stdio() -> Result<(), RuntimeError> {
         }
     }
 
-    // Release the state directory for a successor bridge. A crashed process
-    // leaves the lock behind on purpose; the next start reports it loudly.
-    drop(_state_guard);
-    let _ = std::fs::remove_file(state_dir.join("bridge.lock"));
+    // The OS-level state directory lock releases when the process exits,
+    // orderly or not: a successor (or respawned) bridge takes over cleanly.
     Ok(())
 }
 
