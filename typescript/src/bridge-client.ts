@@ -12,6 +12,11 @@ export interface BridgeProcessConfig {
   env: Record<string, string>
   requestTimeoutMs: number
   shutdownTimeoutMs: number
+  /** Respawn the child after an unexpected exit (default true). */
+  autoRespawn?: boolean
+  /** Give up respawning after this many unexpected exits (default 5); the
+   * client then stays dead and only 'bridge-error' fires. */
+  maxRestarts?: number
 }
 
 export interface RuntimeEventEnvelope {
@@ -69,34 +74,69 @@ interface PendingRequest {
   timeout: ReturnType<typeof setTimeout>
 }
 
-/** Owns one Rust bridge process and multiplexes request responses with async event notifications. */
+/** Owns one Rust bridge process and multiplexes request responses with async event notifications.
+ * The durable journals make a bridge restart survivable (host_seq continues,
+ * bindings replay), so after an unexpected exit the child is respawned and a
+ * 'bridge-restarted' event tells agents to reattach via session.restore. */
 export class JsonlBridgeClient extends EventEmitter {
-  private readonly child: ChildProcessWithoutNullStreams
-  private readonly lines: ReadlineInterface
+  private child!: ChildProcessWithoutNullStreams
+  private lines!: ReadlineInterface
   private readonly pending = new Map<string, PendingRequest>()
   private readonly lastHostSeq = new Map<string, number>()
   private nextId = 0
   private stopping = false
+  private restarts = 0
+  private generation = 0
 
   constructor(private readonly ctx: Context, private readonly config: BridgeProcessConfig) {
     super()
-    this.child = spawn(config.command, config.args, {
-      cwd: config.cwd,
-      env: { ...process.env, ...config.env },
+    this.child = this.spawnChild()
+  }
+
+  /** How many times the child died and came back. */
+  get respawnGeneration(): number {
+    return this.generation
+  }
+
+  /** Test-only: kill the child exactly the way a crash would (no orderly
+   * shutdown), driving the respawn path deterministically. */
+  simulateUnexpectedExit(): void {
+    this.child.kill()
+  }
+
+  private spawnChild(): ChildProcessWithoutNullStreams {
+    const child = spawn(this.config.command, this.config.args, {
+      cwd: this.config.cwd,
+      env: { ...process.env, ...this.config.env },
       stdio: ['pipe', 'pipe', 'pipe'],
     })
-    this.lines = createInterface({ input: this.child.stdout })
-    this.lines.on('line', line => this.onLine(line))
-    this.child.stderr.on('data', chunk => {
+    const lines = createInterface({ input: child.stdout })
+    lines.on('line', line => this.onLine(line))
+    child.stderr.on('data', chunk => {
       const message = String(chunk).trim()
       if (message.length > 0) this.ctx.logger.warn('dsh-rs-bridge stderr: ' + message)
     })
-    this.child.on('error', error => this.failAll(error))
-    this.child.on('exit', (code, signal) => {
-      if (!this.stopping) {
-        this.failAll(new Error('dsh-rs-bridge exited unexpectedly (code=' + code + ', signal=' + signal + ')'))
-      }
-    })
+    child.on('error', error => this.failAll(error))
+    child.on('exit', (code, signal) => this.onExit(code, signal))
+    this.lines = lines
+    return child
+  }
+
+  private onExit(code: number | null, signal: NodeJS.Signals | null): void {
+    if (this.stopping) return
+    this.failAll(new Error('dsh-rs-bridge exited unexpectedly (code=' + code + ', signal=' + signal + ')'))
+    const maxRestarts = this.config.maxRestarts ?? 5
+    if ((this.config.autoRespawn ?? true) === false || this.restarts >= maxRestarts) {
+      this.ctx.logger.error(
+        'dsh-rs-bridge is gone (' + this.restarts + ' restarts used); giving up',
+      )
+      return
+    }
+    this.restarts += 1
+    this.generation += 1
+    this.ctx.logger.info('dsh-rs-bridge exited; respawning (generation ' + this.generation + ')')
+    this.child = this.spawnChild()
+    this.emit('bridge-restarted', { generation: this.generation })
   }
 
   request<T>(method: string, params: Record<string, unknown> = {}, timeoutMs?: number): Promise<T> {
@@ -134,13 +174,15 @@ export class JsonlBridgeClient extends EventEmitter {
   }
 
   async shutdown(): Promise<void> {
+    // Declare shutdown intent BEFORE the RPC: if the child dies while the
+    // request is in flight, onExit must not respawn a successor nobody owns.
+    this.stopping = true
     try {
       await this.request<{ stopping: boolean }>('bridge.shutdown')
     } catch (error) {
-      this.child.kill()
+      if (this.child.exitCode === null && this.child.signalCode === null) this.child.kill()
       throw error
     }
-    this.stopping = true
     await new Promise<void>((resolve, reject) => {
       let settled = false
       const onExit = (): void => {

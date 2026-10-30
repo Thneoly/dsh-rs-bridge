@@ -27,7 +27,7 @@ supplied by the selected adapter and is validated independently.
 
 - runtime.list: list registered runtime adapters, capabilities, and health.
 - runtime.probe: inspect one runtime adapter.
-- session.start: create an execution for a DSH session.
+- session.start: create an execution for a DSH session. A record left behind by a dead bridge (no external binding, or a stale non-terminal status) is taken over instead of erroring; a record that already owns a terminal conversation refuses `start` and points at continuation/restoration.
 - session.resume: reattach to the external session referenced by a DSH session.
 - session.cancel: interrupt an active execution and wait for its terminal state.
 - session.wait: wait until the session reaches a terminal state.

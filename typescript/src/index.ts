@@ -26,6 +26,11 @@ export interface Config {
   /** Budget for one external turn; session.wait/cancel use this instead of
    * the short request timeout. Default matches the bridge prompt budget. */
   turnTimeoutMs: number
+  /** Respawn the bridge process after an unexpected exit and reattach
+   * sessions via session.restore on their next turn (default true). */
+  autoRespawn: boolean
+  /** Give up respawning after this many unexpected exits (default 5). */
+  maxRestarts: number
 }
 
 export const Config: z<Config> = z.object({
@@ -38,6 +43,8 @@ export const Config: z<Config> = z.object({
   shutdownTimeoutMs: z.number().default(3000),
   permissionPolicy: z.union([z.const('deny'), z.const('allow')]).default('deny'),
   turnTimeoutMs: z.number().default(3600000),
+  autoRespawn: z.boolean().default(true),
+  maxRestarts: z.number().default(5),
 })
 
 export function apply(ctx: Context, config: Config): void {
@@ -48,6 +55,8 @@ export function apply(ctx: Context, config: Config): void {
     env: config.env,
     requestTimeoutMs: config.requestTimeoutMs,
     shutdownTimeoutMs: config.shutdownTimeoutMs,
+    autoRespawn: config.autoRespawn,
+    maxRestarts: config.maxRestarts,
   }
   const factoryConfig: RuntimeBridgeFactoryConfig = {
     ...processConfig,

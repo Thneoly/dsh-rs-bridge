@@ -6,8 +6,9 @@ use tokio::sync::{mpsc, Mutex};
 
 use crate::contracts::{
     RuntimeAdapter, RuntimeCapabilities, RuntimeContinueRequest, RuntimeError, RuntimeEvent,
-    RuntimeEventType, RuntimeHealth, RuntimeHealthStatus, RuntimeResumeRequest, RuntimeSendRequest,
-    RuntimeSessionControl, RuntimeSessionHandle, RuntimeStartRequest, RuntimeStatus,
+    RuntimeEventType, RuntimeHealth, RuntimeHealthStatus, RuntimeRestoreRequest,
+    RuntimeResumeRequest, RuntimeSendRequest, RuntimeSessionControl, RuntimeSessionHandle,
+    RuntimeStartRequest, RuntimeStatus,
 };
 
 /// Prompts starting with this marker never reach a terminal state on their own;
@@ -65,7 +66,9 @@ impl MockRuntime {
         RuntimeCapabilities {
             streaming_events: true,
             resume: true,
-            session_restore: false,
+            // The mock keeps no external state, so a persisted binding is
+            // trivially reattachable: plugin restart flows stay testable.
+            session_restore: true,
             interrupt: true,
             live_input: false,
             continuation: self.continuation,
@@ -250,6 +253,17 @@ impl RuntimeAdapter for MockRuntime {
             self.tool_events,
             is_hang_prompt(&request.prompt),
         ))
+    }
+
+    async fn restore_session(&self, request: RuntimeRestoreRequest) -> Result<(), RuntimeError> {
+        if request.cancellation.is_cancelled() {
+            return Err(RuntimeError::Lifecycle(
+                "restore cancelled before mock runtime launch".to_owned(),
+            ));
+        }
+        // Stateless by design: there is nothing to reattach, so restoring a
+        // persisted binding always succeeds.
+        Ok(())
     }
 }
 

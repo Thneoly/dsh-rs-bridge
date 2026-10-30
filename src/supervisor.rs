@@ -237,7 +237,29 @@ impl RuntimeSupervisor {
             created_at_ms: stamp,
             updated_at_ms: stamp,
         };
-        self.inner.sessions.create(record.clone()).await?;
+        // A previous bridge life may have left an orphaned record behind: no
+        // external binding (a start that crashed mid-launch) or a stale
+        // non-terminal status (the process died mid-turn). With no active
+        // in-process execution, a fresh start takes the slot over instead of
+        // bricking the session with a duplicate-create error forever. A record
+        // that already owns a terminal conversation keeps refusing `start`:
+        // continuation and restoration are its entry points.
+        match self.inner.sessions.get(&request.dsh_session_id).await? {
+            None => {
+                self.inner.sessions.create(record.clone()).await?;
+            }
+            Some(previous)
+                if previous.external_session_id.is_none() || !previous.status.is_terminal() =>
+            {
+                self.inner.sessions.update(record.clone()).await?;
+            }
+            Some(_) => {
+                return Err(RuntimeError::Lifecycle(format!(
+                    "session already owns a completed execution; use session.send to continue it, or session.restore after a bridge restart: {}",
+                    request.dsh_session_id
+                )));
+            }
+        }
 
         let handle = match adapter
             .start(RuntimeStartRequest {
