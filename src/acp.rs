@@ -1135,7 +1135,16 @@ impl AcpProcess {
         id: Value,
         params: &Value,
     ) -> Result<(), RuntimeError> {
-        let request_id = id.to_string();
+        // The host-facing request_id must be the agent's id verbatim: JSON-RPC
+        // allows string or number ids, and Value::to_string() would wrap a
+        // string id in JSON quotes ("perm-1" -> "\"perm-1\"") — a host that
+        // echoes or inspects the payload would then miss the lookup. Real
+        // agents observed so far (opencode, claude-code-acp) use the ACP SDK's
+        // numeric counter, but string ids stay protocol-legal.
+        let request_id = match &id {
+            Value::String(inner) => inner.clone(),
+            other => other.to_string(),
+        };
         let options = params
             .get("options")
             .and_then(Value::as_array)
