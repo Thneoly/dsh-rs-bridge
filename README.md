@@ -352,3 +352,10 @@ Unanswered requests are auto-denied after a bounded deadline.
   event log including model output) and per-bridge stderr logs in a temp
   directory and prints the path; the bridge's own durable trail is
   `events.jsonl`, replayable per session via `session.events`.
+- **Using claude-code-acp as the agent** (Claude Code behind ACP): its child
+  `claude` CLI refuses to run inside another Claude Code session — unset
+  `CLAUDECODE` (and the `CLAUDE_CODE_*` session vars) in the environment the
+  bridge inherits, and on Windows set `CLAUDE_CODE_GIT_BASH_PATH` to the
+  real path of `bash.exe` (forward slashes work; backslashes are fine as long
+  as they survive into the env). Verified working end to end, including the
+  permission round-trip.
