@@ -42,6 +42,62 @@ The DSH plugin lives in `typescript/`; see [its integration guide](typescript/RE
 
 See docs/architecture.md, docs/protocol.md, and docs/dsh-baseline.md.
 
+## Quick start: one session over JSONL
+
+With `cargo run -- --stdio` running, write request lines to its stdin and read
+responses/notifications from stdout. A complete first turn against the mock
+runtime (identical flow with a real agent — set the ACP env vars and use
+`runtime_id: "acp"`):
+
+```jsonl
+→ {"protocol":"dsh.runtime.v1","id":"1","method":"runtime.list","params":{}}
+← {"protocol":"dsh.runtime.v1","id":"1","result":[{"id":"mock","capabilities":{"streaming_events":true,"resume":true,"session_restore":true,"interrupt":true,"live_input":false,"continuation":true,"permission_requests":false},"health":{"status":"ready","detail":"deterministic in-process mock"}}]}
+
+→ {"protocol":"dsh.runtime.v1","id":"2","method":"session.start","params":{"dsh_session_id":"demo","runtime_id":"mock","prompt":"hello","cwd":null}}
+← {"protocol":"dsh.runtime.v1","id":"2","result":{"dsh_session_id":"demo","runtime_id":"mock","external_session_id":"mock::demo","status":"running"}}
+← {"protocol":"dsh.runtime.v1","method":"runtime.event","params":{"host_seq":1,"event":{"dsh_session_id":"demo","runtime_id":"mock","external_session_id":"mock::demo","event_type":"runtime.started","runtime_seq":null,"payload":{"external_session_id":"mock::demo"},"at_unix_ms":1790000000000}}
+← {"protocol":"dsh.runtime.v1","method":"runtime.event","params":{"host_seq":2,"event":{"dsh_session_id":"demo","event_type":"runtime.status","payload":{"status":"running","resumed":false},"…":"…"}}
+← {"protocol":"dsh.runtime.v1","method":"runtime.event","params":{"host_seq":3,"event":{"dsh_session_id":"demo","event_type":"assistant.delta","payload":{"text":"mock runtime completed the task"},"…":"…"}}
+← {"protocol":"dsh.runtime.v1","method":"runtime.event","params":{"host_seq":4,"event":{"dsh_session_id":"demo","event_type":"turn.completed","payload":{"status":"completed"},"…":"…"}}
+← {"protocol":"dsh.runtime.v1","method":"runtime.event","params":{"host_seq":5,"event":{"dsh_session_id":"demo","event_type":"runtime.ended","payload":{"status":"completed"},"…":"…"}}
+
+→ {"protocol":"dsh.runtime.v1","id":"3","method":"session.wait","params":{"dsh_session_id":"demo"}}
+← {"protocol":"dsh.runtime.v1","id":"3","result":{"dsh_session_id":"demo","runtime_id":"mock","external_session_id":"mock::demo","status":"completed"}}
+
+→ {"protocol":"dsh.runtime.v1","id":"4","method":"session.send","params":{"dsh_session_id":"demo","text":"again"}}
+← {"protocol":"dsh.runtime.v1","id":"4","result":{"accepted":true}}
+```
+
+Key ordering rules: `host_seq` strictly increases per DSH session; a
+notification's `host_seq` equals the number the durable journal allocated, so
+`session.events {after_host_seq}` resumes exactly where stdout left off. With
+a permission-asking agent you will also see `permission.requested` (answer it
+with `permission.respond`) and `permission.responded`.
+
+## Using from DSH (TypeScript plugin)
+
+Load the plugin from `typescript/` **instead of** `@deepseek-ai/dsh-agent-loop`
+(one AgentFactory slot). Minimal config:
+
+```yaml
+- name: dsh-rs-bridge
+  config:
+    command: ./target/release/dsh-rs-bridge
+    args: ["--stdio"]
+    runtimeId: acp                    # register the agent via the ACP env vars
+    permissionPolicy: deny            # auto-answer forwarded permission requests
+    turnTimeoutMs: 3600000            # turn budget, separate from requestTimeoutMs
+    autoRespawn: true                 # respawn a crashed bridge, restore sessions
+```
+
+Each DSH turn maps to one external execution: user input, streamed assistant
+output, turn/step boundaries, and terminal status are written to the DSH
+Session; tool and permission activity surfaces as transient
+`agent/runtime-event` notifications. `resume({resumeSessionId})` restores a
+persisted DSH session and reattaches the external conversation. If the bridge
+process dies, the plugin respawns it and heals the next turn automatically —
+see [the plugin guide](typescript/README.md) for details.
+
 ## Operating the bridge
 
 ### State directory
@@ -77,6 +133,7 @@ Responses correlate by `id`; the bridge also emits unsolicited
 | `runtime.list` | `{}` | runtime descriptors with capabilities and health |
 | `runtime.probe` | `{runtime_id}` | one descriptor |
 | `session.start` | `{dsh_session_id, runtime_id, prompt, cwd?}` | execution summary (`running`) |
+| `session.resume` | `{dsh_session_id}` | resume an interrupted in-flight execution (only runtimes advertising `resume`) |
 | `session.send` | `{dsh_session_id, text}` | `{accepted: true}` — live input (needs `live_input`) or post-terminal continuation |
 | `session.wait` | `{dsh_session_id}` | summary at terminal state |
 | `session.cancel` | `{dsh_session_id, reason?}` | summary at terminal state (bounded: 30 s without an agent that honors `session/cancel`) |
@@ -134,8 +191,9 @@ CI includes a real-process handshake against the OpenCode 2.2.0 ACP server.
 The test launches the official Linux binary and verifies ACP v1 initialization,
 protocol negotiation, and `session/new`. It intentionally does not submit a
 prompt, so it requires no model provider credentials and incurs no inference
-cost. The deterministic fixture-agent tests still cover streamed output,
-continuation, cancellation, and shutdown.
+cost. The deterministic fixture-agent and mock tests cover the rest: streamed
+output, continuation, cancellation, permission round-trips, agent death and
+restore, journal repair and replay, and bridge self-healing.
 
 You can run the same probe locally with any installed ACP agent:
 
