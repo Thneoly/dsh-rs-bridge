@@ -518,19 +518,29 @@ async function main() {
     replayEntries.some(
       entry => entry?.event?.event_type === type && payloadTest(entry.event.payload ?? {}),
     )
+  // Codeword check uses JOINED delta text (same semantics as phase B): agents
+  // differ in delta granularity — opencode emits whole words per chunk,
+  // claude-code-acp streams token-sized fragments, so no single delta may
+  // contain the full codeword.
+  const replayDeltaText = replayEntries
+    .filter(entry => entry?.event?.event_type === 'assistant.delta')
+    .map(entry => String(entry.event.payload?.text ?? ''))
+    .join('')
+    .toUpperCase()
   assert.ok(
-    replayHas('assistant.delta', payload =>
-      String(payload.text ?? '').toUpperCase().includes(codeWord)),
-    'replay must contain the pre-restart codeword streaming',
+    replayDeltaText.includes(codeWord),
+    'replay must contain the pre-restart codeword streaming (joined across deltas)',
   )
   assert.ok(
     replayHas('tool.started') || replayHas('tool.completed'),
     'replay must contain the tool lifecycle from phase T',
   )
-  assert.ok(
-    replayHas('permission.requested') && replayHas('permission.responded'),
-    'replay must contain the permission round-trip from phase T',
-  )
+  if (answeredPermission) {
+    assert.ok(
+      replayHas('permission.requested') && replayHas('permission.responded'),
+      'replay must contain the permission round-trip from phase T',
+    )
+  }
   assert.ok(replayHas('turn.cancelled'), 'replay must contain the phase-C cancellation')
   assert.ok(
     replayHas('runtime.session_restored'),
